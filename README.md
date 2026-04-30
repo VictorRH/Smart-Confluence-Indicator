@@ -230,7 +230,7 @@ Este es un proyecto de código abierto. Lee el código, entiéndelo, úsalo con 
 ## 📝 Versión
 
 - **v4.2** - Fase 1: Breakout + RSI Contextual + Pivots
-- Próxima: Fase 2 con Wyckoff avanzado (opcional)
+
 
 ---
 
