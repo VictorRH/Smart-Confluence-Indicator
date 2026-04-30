@@ -1,0 +1,427 @@
+//@version=5
+// CHILAQUIL PRO SUITE - SISTEMA DE 2 MODOS (CONSENSO FINAL - V4.2 CON DETECCIÓN AUTOMÁTICA DE TEMPORALIDAD)
+// Modo Conservador: Tendencia + MACD + SQZMOM + RSI <= 30 (Alertas)
+// Modo Equilibrado: Tendencia + MACD + SQZMOM + RSI < 50 (Tabla R/R)
+indicator("Chilaquil PRO Suite", shorttitle="ChilaquilPRO", overlay=false)
+
+// ============================================
+// INPUTS
+// ============================================
+
+// Visual
+show_ema = input.bool(true, "Mostrar EMAs", group="Visual")
+auto_timeframe = input.bool(true, "Auto-Detectar Temporalidad", group="Visual", tooltip="Si está activado, usa EMAs largas en temporalidades >= 1D y EMAs cortas en temporalidades menores")
+manual_ema_mode = input.string("3 EMAs", "Modo EMA Manual", options=["3 EMAs", "2 EMAs Largas"], group="Visual", tooltip="Solo se usa si Auto-Detectar está desactivado")
+show_signals = input.bool(true, "Mostrar Señales", group="Visual")
+show_sqz = input.bool(true, "Mostrar SQZMOM", group="Visual")
+show_macd = input.bool(true, "Mostrar MACD", group="Visual")
+show_table = input.bool(true, "Mostrar Tabla Info", group="Visual")
+
+// SISTEMA DE SEÑALES (2 MODOS)
+signal_mode = input.string("Equilibrado", "Modo de Señales", options=["Conservador", "Equilibrado"], group="Señales", tooltip="Conservador: RSI <= 30 (alertas) | Equilibrado: RSI < 50 (tabla R/R)")
+
+// GESTIÓN DE RIESGO
+show_risk_management = input.bool(true, "Mostrar Gestión de Riesgo", group="Gestión de Riesgo")
+risk_method = input.string("Porcentaje", "Método de Riesgo", options=["ATR", "Porcentaje"], group="Gestión de Riesgo")
+
+// ATR
+atr_length = input.int(14, "ATR Length", group="Gestión de Riesgo")
+atr_multiplier = input.float(2.0, "Multiplicador ATR", group="Gestión de Riesgo", minval=0.1, maxval=5.0, step=0.1)
+
+// Porcentaje
+stop_loss_percent = input.float(3.0, "Stop Loss %", group="Gestión de Riesgo", minval=0.1, maxval=20.0, step=0.1)
+take_profit_multiplier = input.float(2.0, "Multiplicador T/P (R/R)", group="Gestión de Riesgo", minval=0.1, maxval=50.0, step=0.1)
+
+// EMA
+ema_fast = input.int(7, "EMA Rápida (3 EMAs)", group="EMA")
+ema_medium = input.int(15, "EMA Media (3 EMAs)", group="EMA")
+ema_slow = input.int(25, "EMA Lenta (3 EMAs)", group="EMA")
+ema_long_fast = input.int(100, "EMA Rápida Larga (2 EMAs)", group="EMA")
+ema_long_slow = input.int(200, "EMA Lenta Larga (2 EMAs)", group="EMA")
+
+// MACD
+fast_length_macd = input.int(12, "Fast Length", group="MACD")
+slow_length_macd = input.int(26, "Slow Length", group="MACD")
+signal_length_macd = input.int(9, "Signal Smoothing", group="MACD")
+
+// RSI
+rsiLengthInput = input.int(14, "RSI Length", group="RSI")
+rsi_min_long = input.float(40, "RSI Mín LONG", group="RSI", minval=0, maxval=100, step=1)
+rsi_max_long = input.float(65, "RSI Máx LONG", group="RSI", minval=0, maxval=100, step=1)
+rsi_min_short = input.float(35, "RSI Mín SHORT", group="RSI", minval=0, maxval=100, step=1)
+rsi_max_short = input.float(60, "RSI Máx SHORT", group="RSI", minval=0, maxval=100, step=1)
+
+// BREAKOUT & PIVOTS (Mejoras Fase 1)
+breakout_lookback = input.int(20, "Lookback Breakout", group="Mejoras", tooltip="Barras para validar ruptura real")
+pivot_lookback = input.int(5, "Lookback Pivots", group="Mejoras", tooltip="Barras izquierda/derecha para detectar pivots")
+enable_breakout_filter = input.bool(true, "Activar Filtro Breakout", group="Mejoras")
+enable_pivot_filter = input.bool(true, "Activar Filtro Pivots", group="Mejoras")
+
+// SQZMOM
+length = input.int(20, "BB Length", group="SQZMOM")
+mult = input.float(2.0, "BB MultFactor", group="SQZMOM")
+lengthKC = input.int(20, "KC Length", group="SQZMOM")
+multKC = input.float(1.5, "KC MultFactor", group="SQZMOM")
+useTrueRange = input.bool(true, "Use TrueRange (KC)", group="SQZMOM")
+
+// ============================================
+// DETECCIÓN AUTOMÁTICA DE TEMPORALIDAD
+// ============================================
+
+// Detectar temporalidad actual en segundos
+tf_in_seconds = timeframe.in_seconds()
+
+// Umbral: 1 día = 86400 segundos
+// Si la temporalidad es >= 1D (Daily), usar EMAs largas
+// Si es < 1D (intraday), usar EMAs cortas
+is_high_timeframe = tf_in_seconds >= 86400
+
+// Determinar modo EMA final
+use_2_emas = auto_timeframe ? is_high_timeframe : (manual_ema_mode == "2 EMAs Largas")
+
+// ============================================
+// VARIABLES DE PERSISTENCIA
+// ============================================
+var bool position_is_long = false
+var bool position_is_short = false
+var float last_entry_price_long = na
+var float last_sl_long = na
+var float last_tp_long = na
+var float last_entry_price_short = na
+var float last_sl_short = na
+var float last_tp_short = na
+var float last_rr_long = na
+var float last_rr_short = na
+var float activation_rsi_long = na
+var float activation_price_long = na
+var float activation_rsi_short = na
+var float activation_price_short = na
+
+// ============================================
+// CÁLCULOS
+// ============================================
+
+// EMAs
+ema_fast_line = use_2_emas ? ta.ema(close, ema_long_fast) : ta.ema(close, ema_fast)
+ema_medium_line = use_2_emas ? na : ta.ema(close, ema_medium)
+ema_slow_line = use_2_emas ? ta.ema(close, ema_long_slow) : ta.ema(close, ema_slow)
+
+// MACD
+fast_ma = ta.ema(close, fast_length_macd)
+slow_ma = ta.ema(close, slow_length_macd)
+macd = fast_ma - slow_ma
+signal_line = ta.ema(macd, signal_length_macd)
+histogram = macd - signal_line
+
+// RSI
+rsi = ta.rsi(close, rsiLengthInput)
+
+// SQZMOM (Original LazyBear)
+source = close
+basis = ta.sma(source, length)
+dev = mult * ta.stdev(source, length)
+upperBB = basis + dev
+lowerBB = basis - dev
+ma = ta.sma(source, lengthKC)
+range_calc = useTrueRange ? ta.tr : (high - low)
+rangema = ta.sma(range_calc, lengthKC)
+upperKC = ma + rangema * multKC
+lowerKC = ma - rangema * multKC
+
+sqzOn = (lowerBB > lowerKC) and (upperBB < upperKC)
+sqzOff = (lowerBB < lowerKC) and (upperBB > upperKC)
+noSqz = not sqzOn and not sqzOff
+
+highest_high = ta.highest(high, lengthKC)
+lowest_low = ta.lowest(low, lengthKC)
+avg1 = math.avg(highest_high, lowest_low)
+avg2 = ta.sma(close, lengthKC)
+avg_final = math.avg(avg1, avg2)
+val_sqz = ta.linreg(source - avg_final, lengthKC, 0)
+
+// ATR
+atr = ta.atr(atr_length)
+
+// ============================================
+// BREAKOUT & PIVOTS (FILTROS FASE 1)
+// ============================================
+
+// Breakout Real
+breakout_long = enable_breakout_filter ? close > ta.highest(high, breakout_lookback)[1] : true
+breakdown_short = enable_breakout_filter ? close < ta.lowest(low, breakout_lookback)[1] : true
+
+// Pivots Simple (evita resistencias/soportes obvios)
+ph = ta.pivothigh(high, pivot_lookback, pivot_lookback)
+pl = ta.pivotlow(low, pivot_lookback, pivot_lookback)
+
+near_resistance = enable_pivot_filter ? not na(ph) : false
+near_support = enable_pivot_filter ? not na(pl) : false
+
+// RSI Contextual (no fijo)
+rsi_ok_long = rsi >= rsi_min_long and rsi <= rsi_max_long
+rsi_ok_short = rsi <= rsi_max_short and rsi >= rsi_min_short
+
+// ============================================
+// SISTEMA DE SEÑALES
+// ============================================
+
+bullish_trend = use_2_emas ? (ema_fast_line > ema_slow_line) : (ema_fast_line > ema_medium_line and ema_medium_line > ema_slow_line)
+bearish_trend = use_2_emas ? (ema_fast_line < ema_slow_line) : (ema_fast_line < ema_medium_line and ema_medium_line < ema_slow_line)
+macd_bullish = macd > signal_line
+macd_bearish = macd < signal_line
+sqz_bullish = val_sqz > 0 and val_sqz > nz(val_sqz[1])
+sqz_bearish = val_sqz < 0 and val_sqz < nz(val_sqz[1])
+
+// Señales MEJORADAS con filtros Fase 1
+buy_conservative = bullish_trend and macd_bullish and sqz_bullish and rsi <= 30 and breakout_long and not near_resistance
+sell_conservative = bearish_trend and macd_bearish and sqz_bearish and rsi >= 70 and breakdown_short and not near_support
+
+buy_balanced = bullish_trend and macd_bullish and sqz_bullish and rsi_ok_long and breakout_long and not near_resistance
+sell_balanced = bearish_trend and macd_bearish and sqz_bearish and rsi_ok_short and breakdown_short and not near_support
+
+buy_signal = signal_mode == "Conservador" ? buy_conservative : buy_balanced
+sell_signal = signal_mode == "Conservador" ? sell_conservative : sell_balanced
+
+// ============================================
+// GESTIÓN DE RIESGO
+// ============================================
+
+float stop_distance = risk_method == "ATR" ? atr * atr_multiplier : close * (stop_loss_percent / 100)
+float tp_distance = stop_distance * take_profit_multiplier
+
+stop_loss_buy_ref = low - stop_distance
+stop_loss_sell_ref = high + stop_distance
+
+// RESETEO ULTRA-COMPLETO
+if position_is_long and not na(last_sl_long) and not na(last_tp_long)
+    if close <= last_sl_long or close >= last_tp_long
+        position_is_long := false
+        last_entry_price_long := na
+        last_sl_long := na
+        last_tp_long := na
+        last_rr_long := na
+        activation_rsi_long := na
+        activation_price_long := na
+    else if bearish_trend
+        position_is_long := false
+        last_entry_price_long := na
+        last_sl_long := na
+        last_tp_long := na
+        last_rr_long := na
+        activation_rsi_long := na
+        activation_price_long := na
+    else if macd_bearish
+        position_is_long := false
+        last_entry_price_long := na
+        last_sl_long := na
+        last_tp_long := na
+        last_rr_long := na
+        activation_rsi_long := na
+        activation_price_long := na
+    else if rsi > 65
+        position_is_long := false
+        last_entry_price_long := na
+        last_sl_long := na
+        last_tp_long := na
+        last_rr_long := na
+        activation_rsi_long := na
+        activation_price_long := na
+
+if position_is_short and not na(last_sl_short) and not na(last_tp_short)
+    if close >= last_sl_short or close <= last_tp_short
+        position_is_short := false
+        last_entry_price_short := na
+        last_sl_short := na
+        last_tp_short := na
+        last_rr_short := na
+        activation_rsi_short := na
+        activation_price_short := na
+    else if bullish_trend
+        position_is_short := false
+        last_entry_price_short := na
+        last_sl_short := na
+        last_tp_short := na
+        last_rr_short := na
+        activation_rsi_short := na
+        activation_price_short := na
+    else if macd_bullish
+        position_is_short := false
+        last_entry_price_short := na
+        last_sl_short := na
+        last_tp_short := na
+        last_rr_short := na
+        activation_rsi_short := na
+        activation_price_short := na
+    else if rsi < 35
+        position_is_short := false
+        last_entry_price_short := na
+        last_sl_short := na
+        last_tp_short := na
+        last_rr_short := na
+        activation_rsi_short := na
+        activation_price_short := na
+
+if buy_signal
+    position_is_long := true
+    position_is_short := false
+    last_entry_price_long := close
+    last_sl_long := close - stop_distance
+    last_tp_long := close + tp_distance
+    last_rr_long := tp_distance / stop_distance
+    activation_rsi_long := rsi
+    activation_price_long := close
+    last_entry_price_short := na
+    last_sl_short := na
+    last_tp_short := na
+    last_rr_short := na
+    activation_rsi_short := na
+    activation_price_short := na
+    
+if sell_signal
+    position_is_short := true
+    position_is_long := false
+    last_entry_price_short := close
+    last_sl_short := close + stop_distance
+    last_tp_short := close - tp_distance
+    last_rr_short := tp_distance / stop_distance
+    activation_rsi_short := rsi
+    activation_price_short := close
+    last_entry_price_long := na
+    last_sl_long := na
+    last_tp_long := na
+    last_rr_long := na
+    activation_rsi_long := na
+    activation_price_long := na
+
+// ============================================
+// PLOTS GRÁFICO PRINCIPAL (force_overlay)
+// ============================================
+
+// Solución al error de linewidth: usar plots condicionales separados para cada modo
+// Modo 2 EMAs Largas (linewidth más grueso)
+plot(show_ema and use_2_emas ? ema_fast_line : na, "EMA Rápida Larga", color=#2962FF, linewidth=3, force_overlay=true)
+plot(show_ema and use_2_emas ? ema_slow_line : na, "EMA Lenta Larga", color=#00C853, linewidth=3, force_overlay=true)
+
+// Modo 3 EMAs Cortas (linewidth normal)
+plot(show_ema and not use_2_emas ? ema_fast_line : na, "EMA Rápida", color=#2962FF, linewidth=2, force_overlay=true)
+plot(show_ema and not use_2_emas ? ema_medium_line : na, "EMA Media", color=#FF6D00, linewidth=2, force_overlay=true)
+plot(show_ema and not use_2_emas ? ema_slow_line : na, "EMA Lenta", color=#00C853, linewidth=2, force_overlay=true)
+
+plot(show_risk_management and bullish_trend ? stop_loss_buy_ref : na, "Stop Buy Ref", color=color.new(color.red, 60), linewidth=1, style=plot.style_circles, force_overlay=true)
+plot(show_risk_management and bearish_trend ? stop_loss_sell_ref : na, "Stop Sell Ref", color=color.new(color.blue, 60), linewidth=1, style=plot.style_circles, force_overlay=true)
+
+is_equilibrado = signal_mode == "Equilibrado"
+plot(show_signals and is_equilibrado and buy_signal ? close : na, "Señal COMPRA", color=color.new(color.lime, 0), linewidth=2, style=plot.style_circles, force_overlay=true)
+plot(show_signals and is_equilibrado and sell_signal ? close : na, "Señal VENTA", color=color.new(color.orange, 0), linewidth=2, style=plot.style_circles, force_overlay=true)
+
+is_conservador = signal_mode == "Conservador"
+plotshape(show_signals and is_conservador and buy_signal, "🟢 COMPRA", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.normal, force_overlay=true)
+plotshape(show_signals and is_conservador and sell_signal, "🔴 VENTA", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.normal, force_overlay=true)
+
+// ============================================
+// PANEL INFERIOR: SQZMOM y MACD
+// ============================================
+
+bcolor = val_sqz > 0 ? (val_sqz > nz(val_sqz[1]) ? color.lime : color.green) : (val_sqz < nz(val_sqz[1]) ? color.red : color.maroon)
+scolor = noSqz ? color.blue : sqzOn ? color.black : color.gray
+
+plot(show_sqz ? val_sqz : na, "SQZMOM", color=bcolor, style=plot.style_histogram, linewidth=4)
+plot(show_sqz ? 0 : na, "SQZ Zero", color=scolor, style=plot.style_cross, linewidth=2)
+hline(0, "SQZ Baseline", color=color.new(color.gray, 70), linestyle=hline.style_solid)
+
+hist_color = histogram >= 0 ? (histogram[1] < histogram ? #26A69A : #B2DFDB) : (histogram[1] < histogram ? #FFCDD2 : #FF5252)
+
+plot(show_macd ? macd : na, "MACD", color=#2962FF, linewidth=2)
+plot(show_macd ? signal_line : na, "Signal", color=#FF6D00, linewidth=2)
+plot(show_macd ? histogram : na, "Histogram", style=plot.style_columns, color=hist_color, linewidth=3)
+hline(0, "MACD Zero", color=color.new(color.gray, 70), linestyle=hline.style_solid)
+
+// ============================================
+// TABLA INFORMATIVA
+// ============================================
+
+var table info_table = table.new(position.top_left, 2, 21, bgcolor=color.new(#1a1a1a, 10), border_width=2, frame_color=color.new(#00C853, 70), frame_width=2)
+
+if barstate.islast and show_table
+    table.cell(info_table, 0, 0, "📊 CHILAQUIL PRO", text_color=color.white, bgcolor=color.new(#00C853, 30), text_size=size.small)
+    table.cell(info_table, 1, 0, "VALOR", text_color=color.white, bgcolor=color.new(#00C853, 30), text_size=size.small)
+    
+    table.cell(info_table, 0, 1, "Modo Señales", text_color=#00E676, text_size=size.small)
+    mode_display = signal_mode == "Conservador" ? "🔴 Conservador" : "🟡 Equilibrado"
+    table.cell(info_table, 1, 1, mode_display, text_color=#FFC107, text_size=size.small)
+    
+    table.cell(info_table, 0, 2, "EMAs Activas", text_color=#00E676, text_size=size.small)
+    ema_display = use_2_emas ? str.tostring(ema_long_fast) + " / " + str.tostring(ema_long_slow) : str.tostring(ema_fast) + " / " + str.tostring(ema_medium) + " / " + str.tostring(ema_slow)
+    table.cell(info_table, 1, 2, ema_display, text_color=#FFC107, text_size=size.small)
+    
+    table.cell(info_table, 0, 3, "RSI(14)", text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 3, str.tostring(rsi, "#.#"), text_color=rsi > 70 ? #FF5252 : rsi < 30 ? #00E676 : color.white, text_size=size.small)
+    
+    trend_text = bullish_trend ? "🟢 ALCISTA" : bearish_trend ? "🔴 BAJISTA" : "⚪ NEUTRAL"
+    trend_color = bullish_trend ? #00E676 : bearish_trend ? #FF5252 : #FFA726
+    table.cell(info_table, 0, 4, "Tendencia", text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 4, trend_text, text_color=trend_color, text_size=size.small)
+    
+    table.cell(info_table, 0, 5, "MACD", text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 5, macd_bullish ? "🟢 Alcista" : "🔴 Bajista", text_color=macd_bullish ? #00E676 : #FF5252, text_size=size.small)
+    
+    table.cell(info_table, 0, 6, "SQZMOM", text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 6, sqz_bullish ? "🟢 Alcista" : "🔴 Bajista", text_color=sqz_bullish ? #00E676 : #FF5252, text_size=size.small)
+    
+    table.cell(info_table, 0, 7, "━━━ FILTROS FASE 1 ━━━", text_color=#FFC107, text_size=size.small, bgcolor=color.new(#FFC107, 50))
+    table.cell(info_table, 1, 7, " ", text_color=#FFC107, text_size=size.small, bgcolor=color.new(#FFC107, 50))
+    
+    table.cell(info_table, 0, 8, "Breakout (L20)", text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 8, breakout_long ? "🟢 OK" : "🔴 Espera", text_color=breakout_long ? #00E676 : #FF9800, text_size=size.small)
+    
+    table.cell(info_table, 0, 9, "Breakdown (L20)", text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 9, breakdown_short ? "🟢 OK" : "🔴 Espera", text_color=breakdown_short ? #00E676 : #FF9800, text_size=size.small)
+    
+    table.cell(info_table, 0, 10, "Pivots", text_color=#00E676, text_size=size.small)
+    pivot_status = near_resistance or near_support ? (near_resistance ? "⚠️ Resistencia" : "⚠️ Soporte") : "🟢 Libre"
+    table.cell(info_table, 1, 10, pivot_status, text_color=(near_resistance or near_support) ? #FF9800 : #00E676, text_size=size.small)
+    
+    table.cell(info_table, 0, 11, "RSI Contextual", text_color=#00E676, text_size=size.small)
+    rsi_range_text = str.tostring(rsi_min_long) + "-" + str.tostring(rsi_max_long)
+    table.cell(info_table, 1, 11, rsi_range_text, text_color=#FFC107, text_size=size.small)
+    
+    table.cell(info_table, 0, 12, "Método Riesgo", text_color=#FFC107, text_size=size.small)
+    risk_display = risk_method == "ATR" ? "ATR x" + str.tostring(atr_multiplier, "#.#") + " R/R x" + str.tostring(take_profit_multiplier, "#.#") : "% SL:" + str.tostring(stop_loss_percent, "#.#") + " R/R x" + str.tostring(take_profit_multiplier, "#.#")
+    table.cell(info_table, 1, 12, risk_display, text_color=#FFC107, text_size=size.small)
+    
+    is_long_active = position_is_long and not na(last_entry_price_long)
+    
+    table.cell(info_table, 0, 13, "🟢 Open Long", text_color=#4CAF50, text_size=size.small)
+    long_entry_text = is_long_active ? str.tostring(last_entry_price_long, "#.####") + "\n(RSI: " + str.tostring(activation_rsi_long, "#.#") + ")" : "N/A"
+    table.cell(info_table, 1, 13, long_entry_text, bgcolor=is_long_active ? color.new(#4CAF50, 70) : na, text_color=is_long_active ? #4CAF50 : color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 14, "🛑 SL Long", text_color=#FF9800, text_size=size.small)
+    table.cell(info_table, 1, 14, is_long_active ? str.tostring(last_sl_long, "#.####") : "N/A", bgcolor=is_long_active ? color.new(#FF9800, 70) : na, text_color=is_long_active ? #FF9800 : color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 15, "💰 TP Long", text_color=#9C27B0, text_size=size.small)
+    table.cell(info_table, 1, 15, is_long_active ? str.tostring(last_tp_long, "#.####") : "N/A", bgcolor=is_long_active ? color.new(#9C27B0, 70) : na, text_color=is_long_active ? #9C27B0 : color.gray, text_size=size.small)
+    
+    is_short_active = position_is_short and not na(last_entry_price_short)
+
+    table.cell(info_table, 0, 16, "🔴 Open Short", text_color=#F44336, text_size=size.small)
+    short_entry_text = is_short_active ? str.tostring(last_entry_price_short, "#.####") + "\n(RSI: " + str.tostring(activation_rsi_short, "#.#") + ")" : "N/A"
+    table.cell(info_table, 1, 16, short_entry_text, bgcolor=is_short_active ? color.new(#F44336, 70) : na, text_color=is_short_active ? #F44336 : color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 17, "🛑 SL Short", text_color=#FF9800, text_size=size.small)
+    table.cell(info_table, 1, 17, is_short_active ? str.tostring(last_sl_short, "#.####") : "N/A", bgcolor=is_short_active ? color.new(#FF9800, 70) : na, text_color=is_short_active ? #FF9800 : color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 18, "💰 TP Short", text_color=#9C27B0, text_size=size.small)
+    table.cell(info_table, 1, 18, is_short_active ? str.tostring(last_tp_short, "#.####") : "N/A", bgcolor=is_short_active ? color.new(#9C27B0, 70) : na, text_color=is_short_active ? #9C27B0 : color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 19, "📊 R/R Long", text_color=#00BCD4, text_size=size.small)
+    table.cell(info_table, 1, 19, is_long_active ? "1:" + str.tostring(last_rr_long, "#.##") : "N/A", text_color=is_long_active and last_rr_long >= 1.8 ? #00E676 : #FF9800, text_size=size.small)
+    
+    table.cell(info_table, 0, 20, "📊 R/R Short", text_color=#00BCD4, text_size=size.small)
+    table.cell(info_table, 1, 20, is_short_active ? "1:" + str.tostring(last_rr_short, "#.##") : "N/A", text_color=is_short_active and last_rr_short >= 1.8 ? #00E676 : #FF9800, text_size=size.small)
+
+// ============================================
+// ALERTAS
+// ============================================
+
+alertcondition(buy_conservative, "🟢 COMPRA PREMIUM", "Chilaquil PRO: Señal COMPRA Premium (RSI <= 30)")
+alertcondition(sell_conservative, "🔴 VENTA PREMIUM", "Chilaquil PRO: Señal VENTA PREMIUM (RSI >= 70)")
