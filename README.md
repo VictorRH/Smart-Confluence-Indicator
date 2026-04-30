@@ -50,7 +50,7 @@ Este indicador detecta oportunidades de trading basadas en:
 1. Abre TradingView.com
 2. Abre un gráfico (Bitcoin, acciones, forex, etc.)
 3. Ve a "Indicadores" → "Pine Script"
-4. Copia TODO el código de `chilaquilchk.pine`
+4. Copia TODO el código de `Chilaquil-Pro-Trading-System.pine`
 5. Pega y crea el indicador
 
 ### Interpretación de la tabla
