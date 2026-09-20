@@ -1,86 +1,238 @@
-//@version=5
-// CHILAQUIL PRO SUITE - SISTEMA DE 2 MODOS (CONSENSO FINAL - V4.2 CON DETECCIÓN AUTOMÁTICA DE TEMPORALIDAD)
-// Modo Conservador: Tendencia + MACD + SQZMOM + RSI <= 30 (Alertas)
-// Modo Equilibrado: Tendencia + MACD + SQZMOM + RSI < 50 (Tabla R/R)
-indicator("Chilaquil PRO Suite", shorttitle="ChilaquilPRO", overlay=false)
+
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// CHILAQUIL PRO SUITE — V7.8.2 (resultado TP/SL en señal de patrón)
+// ─────────────────────────────────────────────────────────────────────────────
+// MÓDULO 1 · Señales: tendencia (EMA auto por TF) + MACD + SQZMOM + RSI
+//          + filtros Breakout/Pivots corregidos + confirmación anti-repintado
+// MÓDULO 2 · Heatmap Liquidaciones (adaptado de victhoreb, inspirado en
+//          Coinglass) — niveles estimados desde delta de Open Interest,
+//          con AUTO-CONFIGURACIÓN según símbolo y temporalidad
+// MÓDULO 3 · Liquidaciones Agregadas WW (adaptado de BLZRtek) — histograma de
+//          liquidaciones REALES de 6 exchanges (Binance, Bybit, OKX, BitMEX,
+//          Deribit, HTX)
+// FIX V5.0: Pine no permite modificar globales en funciones → ahora los
+//           resets devuelven tupla (asignación externa)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────────────
+// CONTRATOS DEL SISTEMA (auditar esto; la implementación es solo transcribir)
+// Restricción de Pine: las funciones NO pueden mutar globales → el estado se
+// gestiona con asignaciones en scope global; los métodos UDT solo mutan su
+// propia instancia. Cualquier refactor a funciones debe respetar esto.
+//
+// f_norm(src) -> float : src re-escalado a σ100(SQZMOM), clamp ±(3.5σ).
+//   Factor positivo: conserva forma, ceros y cruces.
+// base_long  = EMAs alineadas ∧ MACD>signal ∧ SQZMOM rising ∧ RSI∈[40,65] ∧
+//   close>highest(high,20)[1] ∧ ¬(pivote persistido a <2 ATR de distancia).
+// base_short = espejo exacto (RSI∈[35,60]).
+// operación  = base(modo) ∧ confirmed(cierre de vela) ∧ adx_ok ∧ ¬veto_liq.
+// veto_liq   = cluster de liquidación del lado contrario a <1.5× stop.
+// UDT liquidation: add() suma contratos si el nivel existe; sqz() elimina y
+//   reporta niveles barridos; correct_history() purga invalidados hacia atrás;
+//   sort() ordena prices para búsqueda de vecinos; update_color() aplica
+//   gamma, transparencia y altura dinámica (intensidad relativa al máximo).
+// M4 patrones : ARMED = 3 pivotes con |hombros|≤1.5 ATR, cabeza ≥1 ATR,
+//   simetría ≤2.5×. TRIGGER = cierre a través del valle del hombro derecho.
+// M5 wyckoff  : spring/upthrust = falsa ruptura de lowest/highest[1] del rango
+//   con recuperación de cierre y contexto previo; test = retorno ±0.5 ATR.
+// M6 retroceso: pierna = pivotes ≥3 ATR; entrada = reacción en zona 0.50-0.65;
+//   1 señal por pierna (done_leg). Filtro EMA lenta opcional.
+// M7 FVG      : gap de 3 velas con vela central >1 ATR; arrays activos;
+//   señal = retorno al gap + reacción; expira si el cierre lo mitiga.
+// posición    : entradas solo estando flat en ese lado; salidas = SL/TP
+//   fijados en entrada ∨ cambio de tendencia ∨ MACD contrario ∨ RSI 72/28.
+// ───────────────────────────────────────────────────────────────────────────
+
+indicator('Chilaquil PRO Suite v6', shorttitle='Chilaquil', overlay=false,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 100,
+     max_bars_back = 500, dynamic_requests = true)
 
 // ============================================
-// INPUTS
+// INPUTS — VISUAL / SEÑALES / RIESGO / EMA / MACD / RSI / MEJORAS / SQZ / STOCH
 // ============================================
+show_ema = input.bool(true, 'Mostrar EMAs', group='Visual')
+auto_timeframe = input.bool(true, 'Auto-Detectar Temporalidad', group='Visual', tooltip='EMAs largas en TF >= 1D, cortas en menores')
+manual_ema_mode = input.string('3 EMAs', 'Modo EMA Manual', options=['3 EMAs', '2 EMAs Largas'], group='Visual')
+show_signals = input.bool(true, 'Mostrar Señales', group='Visual')
+show_sqz = input.bool(true, 'Mostrar SQZMOM', group='Visual')
+show_macd = input.bool(true, 'Mostrar MACD', group='Visual')
+show_table = input.bool(true, 'Mostrar Tabla Info', group='Visual')
+show_pivot_levels = input.bool(true, 'Dibujar Niveles de Pivots', group='Visual')
+show_sig_prem = input.bool(true, 'Señales Premium — triángulos 💠', group='Visual')
+show_sig_bal = input.bool(true, 'Señales Equilibrado — círculos', group='Visual')
+normalize_panels = input.bool(true, 'Normalizar escalas del panel', group='Visual', tooltip='Re-escala MACD y Liquidaciones a la volatilidad del SQZMOM para que nada quede aplastado. La forma de las curvas no cambia (factor positivo).')
+liq_clamp_mult = input.float(3.5, 'Límite de picos (× vol. SQZMOM)', group='Visual', minval=1.0, maxval=10.0, step=0.5, tooltip='Acota los valores normalizados a este múltiplo de la volatilidad del SQZMOM. Un día de liquidaciones en cascada ya no aplasta el panel. Sube el valor si ves picos cortados de más.')
 
-// Visual
-show_ema = input.bool(true, "Mostrar EMAs", group="Visual")
-auto_timeframe = input.bool(true, "Auto-Detectar Temporalidad", group="Visual", tooltip="Si está activado, usa EMAs largas en temporalidades >= 1D y EMAs cortas en temporalidades menores")
-manual_ema_mode = input.string("3 EMAs", "Modo EMA Manual", options=["3 EMAs", "2 EMAs Largas"], group="Visual", tooltip="Solo se usa si Auto-Detectar está desactivado")
-show_signals = input.bool(true, "Mostrar Señales", group="Visual")
-show_sqz = input.bool(true, "Mostrar SQZMOM", group="Visual")
-show_macd = input.bool(true, "Mostrar MACD", group="Visual")
-show_table = input.bool(true, "Mostrar Tabla Info", group="Visual")
+signal_mode = input.string('Equilibrado', 'Modo de Operación (estado y alertas)', options=['Conservador', 'Equilibrado'], group='Señales', tooltip='AMBAS familias de señales se dibujan siempre en el gráfico. Este modo solo define cuál maneja el estado de posición (SL/TP de la tabla) y las alertas principales.')
+wait_close = input.bool(true, 'Señales solo al cierre de vela', group='Señales', tooltip='Anti-repintado: confirma solo al cerrar la vela')
 
-// SISTEMA DE SEÑALES (2 MODOS)
-signal_mode = input.string("Equilibrado", "Modo de Señales", options=["Conservador", "Equilibrado"], group="Señales", tooltip="Conservador: RSI <= 30 (alertas) | Equilibrado: RSI < 50 (tabla R/R)")
+show_risk_management = input.bool(true, 'Mostrar Gestión de Riesgo', group='Gestión de Riesgo')
+risk_method = input.string('Porcentaje', 'Método de Riesgo', options=['ATR', 'Porcentaje'], group='Gestión de Riesgo')
+atr_length = input.int(14, 'ATR Length', group='Gestión de Riesgo')
+atr_multiplier = input.float(2.0, 'Multiplicador ATR', group='Gestión de Riesgo', minval=0.1, maxval=5.0, step=0.1)
+stop_loss_percent = input.float(3.0, 'Stop Loss %', group='Gestión de Riesgo', minval=0.1, maxval=20.0, step=0.1)
+take_profit_multiplier = input.float(2.0, 'Multiplicador T/P (R/R)', group='Gestión de Riesgo', minval=0.1, maxval=50.0, step=0.1)
 
-// GESTIÓN DE RIESGO
-show_risk_management = input.bool(true, "Mostrar Gestión de Riesgo", group="Gestión de Riesgo")
-risk_method = input.string("Porcentaje", "Método de Riesgo", options=["ATR", "Porcentaje"], group="Gestión de Riesgo")
+ema_fast = input.int(7, 'EMA Rápida (3 EMAs)', group='EMA')
+ema_medium = input.int(15, 'EMA Media (3 EMAs)', group='EMA')
+ema_slow = input.int(25, 'EMA Lenta (3 EMAs)', group='EMA')
+ema_long_fast = input.int(100, 'EMA Rápida Larga (2 EMAs)', group='EMA')
+ema_long_slow = input.int(200, 'EMA Lenta Larga (2 EMAs)', group='EMA')
 
-// ATR
-atr_length = input.int(14, "ATR Length", group="Gestión de Riesgo")
-atr_multiplier = input.float(2.0, "Multiplicador ATR", group="Gestión de Riesgo", minval=0.1, maxval=5.0, step=0.1)
+fast_length_macd = input.int(12, 'Fast Length', group='MACD')
+slow_length_macd = input.int(26, 'Slow Length', group='MACD')
+signal_length_macd = input.int(9, 'Signal Smoothing', group='MACD')
 
-// Porcentaje
-stop_loss_percent = input.float(3.0, "Stop Loss %", group="Gestión de Riesgo", minval=0.1, maxval=20.0, step=0.1)
-take_profit_multiplier = input.float(2.0, "Multiplicador T/P (R/R)", group="Gestión de Riesgo", minval=0.1, maxval=50.0, step=0.1)
+rsiLengthInput = input.int(14, 'RSI Length', group='RSI')
+rsi_min_long = input.float(40, 'RSI Mín LONG', group='RSI', minval=0, maxval=100, step=1)
+rsi_max_long = input.float(65, 'RSI Máx LONG', group='RSI', minval=0, maxval=100, step=1)
+rsi_min_short = input.float(35, 'RSI Mín SHORT', group='RSI', minval=0, maxval=100, step=1)
+rsi_max_short = input.float(60, 'RSI Máx SHORT', group='RSI', minval=0, maxval=100, step=1)
+rsi_exit_long = input.float(72, 'RSI Salida LONG', group='RSI', minval=50, maxval=100, step=1, tooltip='Salida por sobrecompra. DEBE ser mayor que RSI Máx LONG (65): si coincide con la banda de entrada, la posición se saca al día siguiente de entrar por un tick de RSI.')
+rsi_exit_short = input.float(28, 'RSI Salida SHORT', group='RSI', minval=0, maxval=50, step=1, tooltip='Salida por sobreventa. DEBE ser menor que RSI Mín SHORT (35).')
+enable_adx_filter = input.bool(false, 'Filtrar por fuerza de tendencia (ADX)', group='FILTROS EXTRA ✚', tooltip='Evita entradas en rangos laterales: exige ADX >= mínimo. Actívalo si ves muchas señales fallidas en lateral.')
+adx_len = input.int(14, 'ADX Length', group='FILTROS EXTRA ✚')
+adx_min = input.float(20, 'ADX mínimo', group='FILTROS EXTRA ✚', minval=10, maxval=50, step=1)
+enable_liq_veto = input.bool(true, '🛡️ Vetar entradas contra clusters de liquidación', group='FILTROS EXTRA ✚', tooltip='Bloquea LONG si hay un cluster de liquidaciones de longs más cerca que (multiplicador × tu stop) — y espejo para SHORT. El precio suele ir a barrer esa liquidez antes de despegar: mejor no tener el stop ahí.')
+liq_veto_mult = input.float(1.5, 'Distancia veto (× stop)', group='FILTROS EXTRA ✚', minval=0.5, maxval=5.0, step=0.1)
+show_patterns = input.bool(true, 'Detectar patrones de chart', group='PATRONES 📐', tooltip='Señales independientes de los indicadores: formación + ruptura. No repintan (pivotes confirmados + cierre de vela).')
+pat_pivot_manual = input.int(5, 'Pivot barras (izq/der) — manual', group='PATRONES 📐', minval=2, maxval=15)
+pat_sep_manual = input.int(80, 'Separación máxima — manual', group='PATRONES 📐', minval=10, maxval=300)
+auto_pat_cfg = input.bool(true, '🔧 Auto-ajuste por temporalidad (patrones + Wyckoff + retrocesos)', group='PATRONES 📐', tooltip='ON: pivot, separación, rango Wyckoff, enfriamiento y validez de pierna se ajustan SOLOS según el TF: sensible en intradía, amplio en temporalidades altas. OFF: usa los valores manuales.')
+pat_sh_tol = input.float(1.5, 'Tolerancia hombros/máximos (ATR)', group='PATRONES 📐', minval=0.3, maxval=5.0, step=0.1)
+pat_head_min = input.float(1.0, 'Prominencia mínima cabeza (ATR)', group='PATRONES 📐', minval=0.3, maxval=5.0, step=0.1)
+pat_rr_mult = input.float(2.0, 'R/R objetivo (patrones y Wyckoff)', group='PATRONES 📐', minval=1.0, maxval=5.0, step=0.5, tooltip='El TP de cada señal de patrón = riesgo (entrada→SL) multiplicado por este R/R. El SL se coloca en el extremo del patrón + 0.5 ATR de colchón.')
+show_wyckoff = input.bool(true, 'Detectar eventos Wyckoff', group='WYCKOFF 🌀', tooltip='Eventos mecánicos del método: rupturas falsas de rango + absorción. Señales independientes, no repintan.')
+wyck_len_manual = input.int(60, 'Rango (barras) — manual', group='WYCKOFF 🌀', minval=20, maxval=300, tooltip='Tamaño de la estructura de rango que se evalúa.')
+wyck_cool_manual = input.int(20, 'Enfriamiento — manual', group='WYCKOFF 🌀', minval=5, maxval=100)
+wyck_vol = input.bool(false, 'Exigir volumen climático', group='WYCKOFF 🌀', tooltip='ON: solo Spring/Upthrust con volumen > 1.3× su media (clímax). OFF: acepta también los de bajo volumen (sin oferta/demanda).')
+wyck_vol_mult = input.float(1.3, 'Mult. volumen climático', group='WYCKOFF 🌀', minval=1.0, maxval=3.0, step=0.1)
+show_fib = input.bool(true, 'Entradas en retroceso (núcleo de Elliott)', group='RETROCESOS 🌊', tooltip='La parte OPERATIVA de Elliott sin la subjetividad del conteo: pierna de impulso confirmada + entrada en la zona de retroceso 0.50-0.65 cuando aparece reacción. ANTIOPA la entrada: no espera la ruptura del patrón.')
+fib_zone_a = input.float(0.50, 'Inicio zona retroceso', group='RETROCESOS 🌊', minval=0.2, maxval=0.9, step=0.01)
+fib_zone_b = input.float(0.65, 'Fin zona retroceso', group='RETROCESOS 🌊', minval=0.3, maxval=0.95, step=0.01)
+fib_min_leg = input.float(3.0, 'Pierna mínima (ATR)', group='RETROCESOS 🌊', minval=1.0, maxval=10.0, step=0.5)
+fib_age_manual = input.int(60, 'Validez de la pierna — manual', group='RETROCESOS 🌊', minval=10, maxval=300)
+fib_trend = input.bool(true, 'Solo a favor de la EMA lenta', group='RETROCESOS 🌊', tooltip='LONG solo sobre la EMA lenta, SHORT solo bajo ella.')
+show_fvg = input.bool(true, 'Detectar Fair Value Gaps (FVG)', group='FVG 🕳️', tooltip='Desequilibrio de 3 velas (mecánico, estilo ICT): el precio suele volver a rellenar el gap antes de continuar. Señal = retorno al gap + vela de reacción a favor.')
+fvg_disp_mult = input.float(1.0, 'Desplazamiento mínimo vela central (ATR)', group='FVG 🕳️', minval=0.3, maxval=5.0, step=0.1, tooltip='El FVG debe nacer de un impulso real: la vela del medio mayor que este múltiplo del ATR.')
+fvg_max = input.int(20, 'Máx. FVG activos por lado', group='FVG 🕳️', minval=5, maxval=50)
 
-// EMA
-ema_fast = input.int(7, "EMA Rápida (3 EMAs)", group="EMA")
-ema_medium = input.int(15, "EMA Media (3 EMAs)", group="EMA")
-ema_slow = input.int(25, "EMA Lenta (3 EMAs)", group="EMA")
-ema_long_fast = input.int(100, "EMA Rápida Larga (2 EMAs)", group="EMA")
-ema_long_slow = input.int(200, "EMA Lenta Larga (2 EMAs)", group="EMA")
+breakout_lookback = input.int(20, 'Lookback Breakout', group='Mejoras')
+pivot_lookback = input.int(5, 'Lookback Pivots', group='Mejoras')
+pivot_atr_buffer = input.float(2.0, 'Distancia mínima pivots (ATR)', group='Mejoras', minval=0.5, maxval=10.0, step=0.5)
+enable_breakout_filter = input.bool(true, 'Activar Filtro Breakout', group='Mejoras')
+enable_pivot_filter = input.bool(true, 'Activar Filtro Pivots', group='Mejoras')
 
-// MACD
-fast_length_macd = input.int(12, "Fast Length", group="MACD")
-slow_length_macd = input.int(26, "Slow Length", group="MACD")
-signal_length_macd = input.int(9, "Signal Smoothing", group="MACD")
+length = input.int(20, 'BB Length', group='SQZMOM')
+mult = input.float(2.0, 'BB MultFactor', group='SQZMOM')
+lengthKC = input.int(20, 'KC Length', group='SQZMOM')
+multKC = input.float(1.5, 'KC MultFactor', group='SQZMOM')
+useTrueRange = input.bool(true, 'Use TrueRange (KC)', group='SQZMOM')
 
-// RSI
-rsiLengthInput = input.int(14, "RSI Length", group="RSI")
-rsi_min_long = input.float(40, "RSI Mín LONG", group="RSI", minval=0, maxval=100, step=1)
-rsi_max_long = input.float(65, "RSI Máx LONG", group="RSI", minval=0, maxval=100, step=1)
-rsi_min_short = input.float(35, "RSI Mín SHORT", group="RSI", minval=0, maxval=100, step=1)
-rsi_max_short = input.float(60, "RSI Máx SHORT", group="RSI", minval=0, maxval=100, step=1)
-
-// BREAKOUT & PIVOTS (Mejoras Fase 1)
-breakout_lookback = input.int(20, "Lookback Breakout", group="Mejoras", tooltip="Barras para validar ruptura real")
-pivot_lookback = input.int(5, "Lookback Pivots", group="Mejoras", tooltip="Barras izquierda/derecha para detectar pivots")
-enable_breakout_filter = input.bool(true, "Activar Filtro Breakout", group="Mejoras")
-enable_pivot_filter = input.bool(true, "Activar Filtro Pivots", group="Mejoras")
-
-// SQZMOM
-length = input.int(20, "BB Length", group="SQZMOM")
-mult = input.float(2.0, "BB MultFactor", group="SQZMOM")
-lengthKC = input.int(20, "KC Length", group="SQZMOM")
-multKC = input.float(1.5, "KC MultFactor", group="SQZMOM")
-useTrueRange = input.bool(true, "Use TrueRange (KC)", group="SQZMOM")
+stoch_rsi_len = input.int(14, 'RSI Length (Stoch)', group='STOCHRSI')
+stoch_k_len = input.int(14, 'Stochastic Length', group='STOCHRSI')
+smooth_k = input.int(3, 'K Smoothing', group='STOCHRSI')
+smooth_d = input.int(3, 'D Smoothing (MA)', group='STOCHRSI')
 
 // ============================================
-// DETECCIÓN AUTOMÁTICA DE TEMPORALIDAD
+// INPUTS — MÓDULO HEATMAP (auto-configurable)
 // ============================================
+show_heatmap = input.bool(true, 'Mostrar Heatmap Liquidaciones', group='HEATMAP ⚡')
+auto_liq_cfg = input.bool(true, '🔧 Auto-Configurar (símbolo + temporalidad)', group='HEATMAP ⚡', tooltip='ON: ajusta apalancamientos, resolución intrabar y escala automáticamente. OFF: usa los valores manuales de abajo.')
+lev1_manual = input.int(50, 'Lev 1 (manual)', group='HEATMAP ⚡', minval=0, tooltip='0 = desactivado')
+lev2_manual = input.int(25, 'Lev 2 (manual)', group='HEATMAP ⚡', minval=0)
+lev3_manual = input.int(10, 'Lev 3 (manual)', group='HEATMAP ⚡', minval=0)
+ltf_manual = input.timeframe('5', 'Intrabar Resolution (manual)', group='HEATMAP ⚡', tooltip='Menor = más preciso pero más pesado')
+scale_ticks_manual = input.int(500, 'Scale en ticks (manual)', group='HEATMAP ⚡', minval=10, tooltip='Ancho de cada nivel = mintick × ticks')
+// Se guardan niveles LONG y SHORT por separado. El límite de TradingView es
+// 500 boxes, por lo que 240 por lado deja margen para crear y borrar niveles.
+storage_size = input.int(200, 'Niveles a almacenar', group='HEATMAP ⚡', minval=10, maxval=240, tooltip='Máximo 240 por lado para no exceder el límite de 500 boxes')
+disp = input.float(20, 'Dispersion Factor (%)', minval=0, maxval=100, group='HEATMAP ⚡', tooltip='% de contratos disperso al lado opuesto') / 100
+filter_peaks = input.bool(false, 'Filtrar por señal de OI', group='HEATMAP ⚡')
+sig_m = input.float(1, 'Mult', group='HEATMAP ⚡')
+sig_len = input.int(1000, 'Length', group='HEATMAP ⚡')
+start_mode = input.string('Auto por temporalidad', 'Inicio del heatmap', options=['Auto por temporalidad', 'Manual', 'Todo el historial'], group='HEATMAP ⚡', tooltip='Auto: fecha que mejor se adapta a CADA temporalidad (la liquidez tiene vida útil; la vieja es posición muerta). Manual: usa la fecha de abajo. Todo: sin límite (más pesado).')
+start_time = input.time(0, 'Fecha manual', group='HEATMAP ⚡', tooltip='Solo se usa si Inicio del heatmap = Manual.')
+liq_top_color = input.color(#eaff00, 'Color intenso', group='HEATMAP ⚡', tooltip='Color de los clusters con MÁS liquidez. Amarillo neón = máxima visibilidad sobre fondo oscuro.')
+liq_btm_color = input.color(#1a237e, 'Color suave', group='HEATMAP ⚡', tooltip='Color de los clusters con poca liquidez.')
+liq_gamma = input.float(0.6, 'Potencia de color (gamma)', group='HEATMAP ⚡', minval=0.2, maxval=2.0, step=0.1, tooltip='< 1 (ej. 0.6) ilumina también los clusters medianos: el heatmap "enciende" más rápido. 1 = gradiente lineal. > 1 solo los clusters enormes brillan.')
+liq_scale_pct = input.float(0.05, 'Ancho de nivel (auto, % del precio)', group='HEATMAP ⚡', minval=0.01, maxval=1.0, step=0.01, tooltip='Alto base de cada nivel en modo auto. En DIARIO súbelo a 0.15-0.30 para que se vean gruesos; en 30min con 0.03-0.05 basta.')
+liq_height_boost = input.float(6.0, 'Crecimiento clusters intensos (×)', group='HEATMAP ⚡', minval=0.0, maxval=20.0, step=0.5, tooltip='Los niveles con más liquidez CRECEN verticalmente hasta este múltiplo del ancho base. 0 = todos iguales (comportamiento anterior).')
+liq_extend = input.int(40, 'Extensión horizontal (barras)', group='HEATMAP ⚡', minval=0, maxval=500, tooltip='Cuánto se extiende cada nivel hacia la IZQUIERDA. 40 = franjas cortas (hasta la mitad del gráfico aprox). Ajusta de 10 en 10 para afinar el ancho exacto. 0 = solo desde que nació el nivel.')
+liq_transp = input.int(45, 'Transparencia fondo (%)', group='HEATMAP ⚡', minval=0, maxval=90, tooltip='Las velas se ven A TRAVÉS del heatmap (TradingView no permite dibujar detrás de las velas; esto es el equivalente). El borde del nivel queda más sólido para marcar el precio exacto.')
 
-// Detectar temporalidad actual en segundos
+// ============================================
+// INPUTS — MÓDULO LIQUIDACIONES AGREGADAS (BLZRtek)
+// ============================================
+show_aggs = input.bool(true, 'Mostrar Liquidaciones Agregadas', group='AGG LIQ 📊')
+i_tf = input.timeframe('', 'Timeframe (vacío = gráfico)', group='AGG LIQ 📊')
+i_window = input.int(1, 'Ventana acumulación (barras)', minval=1, maxval=500, group='AGG LIQ 📊')
+i_binance = input.bool(true, 'Binance', group='AGG LIQ 📊 · Exchanges')
+i_bybit = input.bool(true, 'Bybit', group='AGG LIQ 📊 · Exchanges')
+i_okx = input.bool(true, 'OKX', group='AGG LIQ 📊 · Exchanges')
+i_bitmex = input.bool(true, 'BitMEX', group='AGG LIQ 📊 · Exchanges')
+i_deribit = input.bool(true, 'Deribit', group='AGG LIQ 📊 · Exchanges')
+i_htx = input.bool(true, 'HTX', group='AGG LIQ 📊 · Exchanges')
+i_col_short = input.color(color.new(#ef5350, 20), 'Color Short Liq.', group='AGG LIQ 📊 · Display')
+i_col_long = input.color(color.new(#26a69a, 20), 'Color Long Liq.', group='AGG LIQ 📊 · Display')
+i_cloud = input.bool(true, 'Mostrar Nube Acumulada', group='AGG LIQ 📊 · Display')
+i_cloud_len = input.int(20, 'Ventana nube (barras)', minval=2, maxval=500, group='AGG LIQ 📊 · Display')
+
+// ============================================
+// AUTO-DETECT TEMPORALIDAD + AUTO-CONFIG HEATMAP
+// ============================================
 tf_in_seconds = timeframe.in_seconds()
-
-// Umbral: 1 día = 86400 segundos
-// Si la temporalidad es >= 1D (Daily), usar EMAs largas
-// Si es < 1D (intraday), usar EMAs cortas
 is_high_timeframe = tf_in_seconds >= 86400
+use_2_emas = auto_timeframe ? is_high_timeframe : (manual_ema_mode == '2 EMAs Largas')
 
-// Determinar modo EMA final
-use_2_emas = auto_timeframe ? is_high_timeframe : (manual_ema_mode == "2 EMAs Largas")
+// AUTO-CONFIG: apalancamientos según temporalidad (swing en diario → niveles amplios)
+[auto_l1, auto_l2, auto_l3] = if tf_in_seconds < 240
+    [75, 50, 25]
+else if tf_in_seconds < 86400
+    [50, 25, 10]
+else
+    [25, 10, 5]
+lev1 = auto_liq_cfg ? auto_l1 : lev1_manual
+lev2 = auto_liq_cfg ? auto_l2 : lev2_manual
+lev3 = auto_liq_cfg ? auto_l3 : lev3_manual
+ltf = auto_liq_cfg ? (tf_in_seconds < 240 ? '1' : tf_in_seconds < 3600 ? '5' : tf_in_seconds < 86400 ? '15' : tf_in_seconds < 604800 ? '60' : '240') : ltf_manual
+// AUTO-CONFIG: ancho de nivel ≈ 0.05% del precio (mismo detalle en BTC, ETH o ZEC)
+scale_ticks = auto_liq_cfg ? math.max(20, math.round(close * (liq_scale_pct / 100) / syminfo.mintick)) : scale_ticks_manual
+scale = syminfo.mintick * scale_ticks
+
+// AUTO-AJUSTE DE PATRONES / WYCKOFF / RETROCESOS POR TEMPORALIDAD
+// Intradía: estructuras cortas y sensibles. Temporalidades altas: pivotes
+// grandes para no confundir ruido con patrón.
+[auto_pat_pivot, auto_pat_sep] = if tf_in_seconds < 3600
+    [3, 60]
+else if tf_in_seconds < 14400
+    [4, 100]
+else if tf_in_seconds < 86400
+    [5, 150]
+else if tf_in_seconds < 604800
+    [8, 300]
+else
+    [12, 500]
+pat_pivot = auto_pat_cfg ? auto_pat_pivot : pat_pivot_manual
+pat_sep_max = auto_pat_cfg ? auto_pat_sep : pat_sep_manual
+[auto_wyck_len, auto_wyck_cool] = if tf_in_seconds < 3600
+    [30, 8]
+else if tf_in_seconds < 14400
+    [45, 12]
+else if tf_in_seconds < 86400
+    [60, 20]
+else if tf_in_seconds < 604800
+    [120, 40]
+else
+    [250, 80]
+wyck_len = auto_pat_cfg ? auto_wyck_len : wyck_len_manual
+wyck_cool = auto_pat_cfg ? auto_wyck_cool : wyck_cool_manual
+fib_age_auto = tf_in_seconds < 3600 ? 30 : tf_in_seconds < 14400 ? 45 : tf_in_seconds < 86400 ? 60 : tf_in_seconds < 604800 ? 120 : 250
+fib_age = auto_pat_cfg ? fib_age_auto : fib_age_manual
 
 // ============================================
-// VARIABLES DE PERSISTENCIA
+// PERSISTENCIA DEL ESTADO DE LAS POSICIONES
 // ============================================
 var bool position_is_long = false
 var bool position_is_short = false
@@ -98,73 +250,632 @@ var float activation_rsi_short = na
 var float activation_price_short = na
 
 // ============================================
-// CÁLCULOS
+// CÁLCULOS PRINCIPALES
 // ============================================
-
-// EMAs
 ema_fast_line = use_2_emas ? ta.ema(close, ema_long_fast) : ta.ema(close, ema_fast)
 ema_medium_line = use_2_emas ? na : ta.ema(close, ema_medium)
 ema_slow_line = use_2_emas ? ta.ema(close, ema_long_slow) : ta.ema(close, ema_slow)
 
-// MACD
 fast_ma = ta.ema(close, fast_length_macd)
 slow_ma = ta.ema(close, slow_length_macd)
 macd = fast_ma - slow_ma
 signal_line = ta.ema(macd, signal_length_macd)
 histogram = macd - signal_line
 
-// RSI
 rsi = ta.rsi(close, rsiLengthInput)
 
-// SQZMOM (Original LazyBear)
-source = close
-basis = ta.sma(source, length)
-dev = mult * ta.stdev(source, length)
+basis = ta.sma(close, length)
+dev = mult * ta.stdev(close, length)
 upperBB = basis + dev
 lowerBB = basis - dev
-ma = ta.sma(source, lengthKC)
+maKC = ta.sma(close, lengthKC)
 range_calc = useTrueRange ? ta.tr : (high - low)
 rangema = ta.sma(range_calc, lengthKC)
-upperKC = ma + rangema * multKC
-lowerKC = ma - rangema * multKC
-
+upperKC = maKC + rangema * multKC
+lowerKC = maKC - rangema * multKC
 sqzOn = (lowerBB > lowerKC) and (upperBB < upperKC)
 sqzOff = (lowerBB < lowerKC) and (upperBB > upperKC)
 noSqz = not sqzOn and not sqzOff
-
 highest_high = ta.highest(high, lengthKC)
 lowest_low = ta.lowest(low, lengthKC)
 avg1 = math.avg(highest_high, lowest_low)
 avg2 = ta.sma(close, lengthKC)
 avg_final = math.avg(avg1, avg2)
-val_sqz = ta.linreg(source - avg_final, lengthKC, 0)
+val_sqz = ta.linreg(close - avg_final, lengthKC, 0)
 
-// ATR
 atr = ta.atr(atr_length)
 
-// ============================================
-// BREAKOUT & PIVOTS (FILTROS FASE 1)
-// ============================================
+rsi_stoch = ta.rsi(close, stoch_rsi_len)
+highest_rsi = ta.highest(rsi_stoch, stoch_k_len)
+lowest_rsi = ta.lowest(rsi_stoch, stoch_k_len)
+stoch_rsi_val = (rsi_stoch - lowest_rsi) / (highest_rsi - lowest_rsi) * 100
+k_stoch = ta.sma(stoch_rsi_val, smooth_k)
+d_stoch = ta.sma(k_stoch, smooth_d)
 
-// Breakout Real
+// ============================================
+// BREAKOUT + PIVOTS (fix: persistencia + distancia ATR)
+// ============================================
 breakout_long = enable_breakout_filter ? close > ta.highest(high, breakout_lookback)[1] : true
 breakdown_short = enable_breakout_filter ? close < ta.lowest(low, breakout_lookback)[1] : true
 
-// Pivots Simple (evita resistencias/soportes obvios)
 ph = ta.pivothigh(high, pivot_lookback, pivot_lookback)
 pl = ta.pivotlow(low, pivot_lookback, pivot_lookback)
 
-near_resistance = enable_pivot_filter ? not na(ph) : false
-near_support = enable_pivot_filter ? not na(pl) : false
+var float last_ph = na
+var float last_pl = na
+if not na(ph)
+    last_ph := ph
+if not na(pl)
+    last_pl := pl
 
-// RSI Contextual (no fijo)
+safety_dist = atr * pivot_atr_buffer
+near_resistance = enable_pivot_filter and not na(last_ph) and close < last_ph and (last_ph - close) < safety_dist
+near_support = enable_pivot_filter and not na(last_pl) and close > last_pl and (close - last_pl) < safety_dist
+res_dist_atr = not na(last_ph) and close < last_ph and atr > 0 ? (last_ph - close) / atr : na
+sup_dist_atr = not na(last_pl) and close > last_pl and atr > 0 ? (close - last_pl) / atr : na
+
 rsi_ok_long = rsi >= rsi_min_long and rsi <= rsi_max_long
 rsi_ok_short = rsi <= rsi_max_short and rsi >= rsi_min_short
+
+// ═══════════════════════════════════════════════════════════
+// MÓDULO 4 · PATRONES DE CHART (HCH, HCH invertida, doble techo/suelo)
+// Detección algorítmica sobre pivotes CONFIRMADOS + gatillo = ruptura del
+// valle del hombro derecho (aproximación de la neckline). No repinta.
+// ═══════════════════════════════════════════════════════════
+pat_ph = ta.pivothigh(high, pat_pivot, pat_pivot)
+pat_pl = ta.pivotlow(low, pat_pivot, pat_pivot)
+
+var float ph_a = na
+var int ph_ab = 0
+var float ph_b = na
+var int ph_bb = 0
+var float ph_c = na
+var int ph_cb = 0
+var bool hch_armed = false
+var float hch_ref = na
+var bool dt_armed = false
+var float dt_ref = na
+var float dt_top = na
+
+var float pl_a = na
+var int pl_ab = 0
+var float pl_b = na
+var int pl_bb = 0
+var float pl_c = na
+var int pl_cb = 0
+var bool hsi_armed = false
+var float hsi_ref = na
+var bool db_armed = false
+var float db_ref = na
+var float db_bot = na
+
+if not na(pat_ph)
+    ph_a := ph_b
+    ph_ab := ph_bb
+    ph_b := ph_c
+    ph_bb := ph_cb
+    ph_c := pat_ph
+    ph_cb := bar_index - pat_pivot
+    hch_armed := false
+    dt_armed := false
+    if not na(ph_a)
+        sep1 = ph_bb - ph_ab
+        sep2 = ph_cb - ph_bb
+        sym_ok = sep1 >= pat_pivot and sep2 >= pat_pivot and sep1 <= pat_sep_max and sep2 <= pat_sep_max and math.max(sep1, sep2) <= 2.5 * math.min(sep1, sep2)
+        // HCH: hombros a altura similar + cabeza prominente + simetría
+        if math.abs(ph_a - ph_c) <= atr * pat_sh_tol and ph_b - math.max(ph_a, ph_c) >= atr * pat_head_min and sym_ok
+            hch_armed := true
+            hch_ref := low
+        // Doble techo: dos máximos similares separados
+        dt_sep = ph_cb - ph_bb
+        if math.abs(ph_b - ph_c) <= atr * pat_sh_tol and dt_sep >= pat_pivot and dt_sep <= pat_sep_max
+            dt_armed := true
+            dt_ref := low
+            dt_top := math.max(ph_b, ph_c)
+
+if hch_armed
+    if bar_index - ph_cb > pat_sep_max or close > ph_b
+        hch_armed := false
+    else
+        hch_ref := math.min(hch_ref, low)
+if dt_armed
+    if bar_index - ph_cb > pat_sep_max or close > dt_top
+        dt_armed := false
+    else
+        dt_ref := math.min(dt_ref, low)
+
+pat_hch_short_raw = hch_armed and close < hch_ref
+pat_2t_short_raw = dt_armed and close < dt_ref
+
+if not na(pat_pl)
+    pl_a := pl_b
+    pl_ab := pl_bb
+    pl_b := pl_c
+    pl_bb := pl_cb
+    pl_c := pat_pl
+    pl_cb := bar_index - pat_pivot
+    hsi_armed := false
+    db_armed := false
+    if not na(pl_a)
+        sep1l = pl_bb - pl_ab
+        sep2l = pl_cb - pl_bb
+        sym_okl = sep1l >= pat_pivot and sep2l >= pat_pivot and sep1l <= pat_sep_max and sep2l <= pat_sep_max and math.max(sep1l, sep2l) <= 2.5 * math.min(sep1l, sep2l)
+        // HCH invertida: hombros similares + cabeza hundida prominente
+        if math.abs(pl_a - pl_c) <= atr * pat_sh_tol and math.min(pl_a, pl_c) - pl_b >= atr * pat_head_min and sym_okl
+            hsi_armed := true
+            hsi_ref := high
+        // Doble suelo: dos mínimos similares separados
+        db_sep = pl_cb - pl_bb
+        if math.abs(pl_b - pl_c) <= atr * pat_sh_tol and db_sep >= pat_pivot and db_sep <= pat_sep_max
+            db_armed := true
+            db_ref := high
+            db_bot := math.min(pl_b, pl_c)
+
+if hsi_armed
+    if bar_index - pl_cb > pat_sep_max or close < pl_b
+        hsi_armed := false
+    else
+        hsi_ref := math.max(hsi_ref, high)
+if db_armed
+    if bar_index - pl_cb > pat_sep_max or close < db_bot
+        db_armed := false
+    else
+        db_ref := math.max(db_ref, high)
+
+pat_hsi_long_raw = hsi_armed and close > hsi_ref
+pat_2b_long_raw = db_armed and close > db_ref
+
+// ═══════════════════════════════════════════════════════════
+// MÓDULO 5 · WYCKOFF — Spring, Upthrust, Test y Effort vs Result
+// Eventos MECÁNICOS (no subjetivos): ruptura falsa de la estructura
+// de rango + recuperación = maniobras de absorción de los grandes
+// jugadores. Las fases A-E completas son subjetivas y no se automatizan.
+// ═══════════════════════════════════════════════════════════
+wyck_sup = ta.lowest(low, wyck_len)[1]
+wyck_res = ta.highest(high, wyck_len)[1]
+vol_climax = volume > ta.sma(volume, 20) * wyck_vol_mult
+vol_ok = not wyck_vol or vol_climax
+
+// SPRING: el precio rompe el soporte del rango pero CIERRA de vuelta
+// dentro, tras una caída previa = barrida de stops + absorción alcista.
+spring_raw = low < wyck_sup and close > wyck_sup and close < close[wyck_len] and vol_ok
+// UPTHRUST: espejo — rompe la resistencia y vuelve dentro, tras subida.
+upthrust_raw = high > wyck_res and close < wyck_res and close > close[wyck_len] and vol_ok
+
+var int last_spring = -100000
+var int last_upthrust = -100000
+spring_sig = spring_raw and bar_index - last_spring > wyck_cool
+upthrust_sig = upthrust_raw and bar_index - last_upthrust > wyck_cool
+if spring_sig
+    last_spring := bar_index
+if upthrust_sig
+    last_upthrust := bar_index
+
+// TEST: vuelta al nivel del Spring/Upthrust que AGUANTA y cierra a favor.
+// Es la segunda oportunidad (y de mayor probabilidad) del método.
+var float spring_low = na
+var float upthrust_high = na
+if spring_sig
+    spring_low := low
+test_spring_raw = not na(spring_low) and bar_index - last_spring > 3 and low <= spring_low + atr * 0.5 and close > open and close > spring_low
+if test_spring_raw
+    spring_low := na
+if upthrust_sig
+    upthrust_high := high
+test_upthrust_raw = not na(upthrust_high) and bar_index - last_upthrust > 3 and high >= upthrust_high - atr * 0.5 and close < open and close < upthrust_high
+if test_upthrust_raw
+    upthrust_high := na
+
+// EFFORT vs RESULT (absorción): mucho ESFUERZO (volumen alto) pero poco
+// RESULTADO (vela pequeña) = alguien absorbe toda la oferta/demanda.
+er_big_vol = volume > ta.sma(volume, 20) * 1.5
+er_small_range = (high - low) < atr * 0.8
+er_close_up = (close - low) > (high - close)
+er_long = show_wyckoff and er_big_vol and er_small_range and er_close_up and close < close[wyck_len]
+er_short = show_wyckoff and er_big_vol and er_small_range and not er_close_up and close > close[wyck_len]
+
+// ═══════════════════════════════════════════════════════════
+// MÓDULO 6 · RETROCESOS — núcleo operativo de Elliott (SIN conteo subjetivo)
+// Pierna de impulso = últimos pivotes significativos. Entrada = retroceso
+// en zona 0.50-0.65 + vela de reacción. Anticipa la entrada: compra la
+// corrección, no espera la ruptura.
+// ═══════════════════════════════════════════════════════════
+var float zzl = na
+var int zzlb = 0
+var float zzh = na
+var int zzhb = 0
+if not na(pat_pl)
+    zzl := pat_pl
+    zzlb := bar_index - pat_pivot
+if not na(pat_ph)
+    zzh := pat_ph
+    zzhb := bar_index - pat_pivot
+
+var int fib_long_done_leg = -1
+var int fib_short_done_leg = -1
+if not na(pat_ph)
+    fib_long_done_leg := -1
+if not na(pat_pl)
+    fib_short_done_leg := -1
+
+leg_up = not na(zzh) and not na(zzl) and zzhb > zzlb and (zzh - zzl) >= atr * fib_min_leg and bar_index - zzhb <= fib_age
+leg_dn = not na(zzh) and not na(zzl) and zzlb > zzhb and (zzh - zzl) >= atr * fib_min_leg and bar_index - zzlb <= fib_age
+
+ret_up = leg_up ? (zzh - low) / (zzh - zzl) : na
+ret_dn = leg_dn ? (high - zzl) / (zzh - zzl) : na
+in_zone_long = leg_up and ret_up >= fib_zone_a and ret_up <= fib_zone_b and low > zzl
+in_zone_short = leg_dn and ret_dn >= fib_zone_a and ret_dn <= fib_zone_b and high < zzh
+
+bull_react = close > open and (close - low) > (high - close)
+bear_react = close < open and (high - close) > (close - low)
+trend_ok_long = not fib_trend or close > ema_slow_line
+trend_ok_short = not fib_trend or close < ema_slow_line
+
+fib_long_raw = in_zone_long and bull_react and trend_ok_long and fib_long_done_leg != zzhb
+fib_short_raw = in_zone_short and bear_react and trend_ok_short and fib_short_done_leg != zzlb
+if fib_long_raw
+    fib_long_done_leg := zzhb
+if fib_short_raw
+    fib_short_done_leg := zzlb
+
+// ═══════════════════════════════════════════════════════════
+// MÓDULO 7 · FAIR VALUE GAPS (FVG) — desequilibrios de 3 velas
+// Bullish: low[2] > high → gap [high, low[2]] creado por desplazamiento.
+// Bearish: high[2] < low → gap [high[2], low].
+// Señal: el precio VUELVE al gap y reacciona a favor (relleno parcial).
+// ═══════════════════════════════════════════════════════════
+fvg_up_new = low[2] > high and (high[1] - low[1]) > atr * fvg_disp_mult
+fvg_dn_new = high[2] < low and (high[1] - low[1]) > atr * fvg_disp_mult
+
+var array<float> fvgU_top = array.new<float>()
+var array<float> fvgU_bot = array.new<float>()
+var array<int> fvgU_bar = array.new<int>()
+var array<float> fvgD_top = array.new<float>()
+var array<float> fvgD_bot = array.new<float>()
+var array<int> fvgD_bar = array.new<int>()
+
+if show_fvg
+    if fvg_up_new
+        if array.size(fvgU_top) >= fvg_max
+            array.shift(fvgU_top), array.shift(fvgU_bot), array.shift(fvgU_bar)
+        array.push(fvgU_top, low[2]), array.push(fvgU_bot, high), array.push(fvgU_bar, bar_index)
+    if fvg_dn_new
+        if array.size(fvgD_top) >= fvg_max
+            array.shift(fvgD_top), array.shift(fvgD_bot), array.shift(fvgD_bar)
+        array.push(fvgD_top, low), array.push(fvgD_bot, high[2]), array.push(fvgD_bar, bar_index)
+
+bool fvg_long_raw = false
+bool fvg_short_raw = false
+var int last_fvg_long = -100000
+var int last_fvg_short = -100000
+if show_fvg and bar_index - last_fvg_long > 5 and array.size(fvgU_top) > 0
+    for i = array.size(fvgU_top) - 1 to 0
+        float t = array.get(fvgU_top, i)
+        float b = array.get(fvgU_bot, i)
+        if close < b
+            // Gap mitigado por completo → se descarta
+            array.remove(fvgU_top, i), array.remove(fvgU_bot, i), array.remove(fvgU_bar, i)
+        else if low <= t and bull_react and trend_ok_long
+            // Retorno al gap + reacción alcista → señal
+            fvg_long_raw := true
+            last_fvg_long := bar_index
+            array.remove(fvgU_top, i), array.remove(fvgU_bot, i), array.remove(fvgU_bar, i)
+if show_fvg and bar_index - last_fvg_short > 5 and array.size(fvgD_top) > 0
+    for i = array.size(fvgD_top) - 1 to 0
+        float t2 = array.get(fvgD_top, i)
+        float b2 = array.get(fvgD_bot, i)
+        if close > t2
+            array.remove(fvgD_top, i), array.remove(fvgD_bot, i), array.remove(fvgD_bar, i)
+        else if high >= b2 and bear_react and trend_ok_short
+            fvg_short_raw := true
+            last_fvg_short := bar_index
+            array.remove(fvgD_top, i), array.remove(fvgD_bot, i), array.remove(fvgD_bar, i)
+
+
+
+
+
+// ═══════════════════════════════════════════════════════════
+// MÓDULO 2 · HEATMAP DE LIQUIDACIONES (adaptado de victhoreb)
+// Estima liquidation levels desde el delta de Open Interest de Binance.
+// Sube = clusters de shorts (imán alcista) · Abajo = clusters de longs
+// ═══════════════════════════════════════════════════════════
+// ── INICIO AUTOMÁTICO SEGÚN TEMPORALIDAD ──
+// La liquidez de apalancamiento tiene VIDA ÚTIL: las posiciones se cierran o
+// se liquidan en semanas/meses. Una fecha de inicio bien elegida:
+//  1) elimina niveles muertos (precisión: solo liquidez que aún existe),
+//  2) acelera el indicador (todo lo anterior a la fecha se salta).
+auto_start = if tf_in_seconds < 900
+    timenow - 7 * 86400000      // < 15m : 1 semana (posiciones intradía viven horas-días)
+else if tf_in_seconds < 3600
+    timenow - 30 * 86400000     // < 1H  : 1 mes (ciclo de swing corto)
+else if tf_in_seconds < 14400
+    timenow - 90 * 86400000     // < 4H  : 3 meses (un trimestre de estructura)
+else if tf_in_seconds < 86400
+    timenow - 180 * 86400000    // < 1D  : 6 meses (2 semestres de acumulación)
+else if tf_in_seconds < 604800
+    timenow - 730 * 86400000    // < 1W  : 2 años (ciclos completos de mercado)
+else
+    timenow - 1825 * 86400000   // ≥ 1W  : 5 años (solo en mensual tiene sentido)
+start_time := start_mode == 'Manual' ? start_time : start_mode == 'Todo el historial' ? 0 : auto_start
+if barstate.isfirst and time > start_time
+    start_time := time
+
+var int start_idx = 0
+if start_time > 0
+    if time[1] < start_time and time >= start_time
+        start_idx := bar_index
+start_time_cond = start_time <= 0 or (start_idx > 0 and bar_index > start_idx)
+
+[oid, oid_high, oid_low] = request.security('BINANCE:' + syminfo.basecurrency + 'USDT.P_OI', timeframe.period, [close - close[1], high - close[1], low - close[1]], ignore_invalid_symbol=true)
+oid_abs = math.max(math.abs(oid_high), math.abs(oid_low))
+oid_abs_signal = ta.sma(oid_abs, sig_len) + sig_m * ta.stdev(oid_abs, sig_len)
+oid_cond = not filter_peaks or oid_abs > oid_abs_signal
+
+type liq_lvl
+    box lvl
+    float contracts
+
+type liquidation
+    liq_lvl[] liq
+    float[] prices
+    float direction
+
+type liq_bar
+    float h
+    float o
+    float c
+    float l
+    float contracts
+
+method eliminate(liquidation l, int i) =>
+    l.liq.get(i).lvl.delete()
+    l.liq.remove(i)
+    l.prices.remove(i)
+
+method add(liquidation l, box lvl, float contracts, float price) =>
+    bool overlap = false
+    if l.liq.size() > 0
+        if l.liq.size() == storage_size
+            l.eliminate(0)
+        for i = 0 to l.liq.size() - 1
+            _lvl = l.liq.get(i).lvl
+            _contracts = l.liq.get(i).contracts
+            if lvl.get_top() == _lvl.get_top()
+                lvl.delete()
+                overlap := true
+                _lvl.set_right(bar_index)
+                l.liq.set(i, liq_lvl.new(_lvl, _contracts + contracts))
+    if not overlap
+        l.liq.push(liq_lvl.new(lvl, contracts))
+        l.prices.push(price)
+
+method correct_history(liquidation l) =>
+    if l.prices.size() > 0
+        // Al borrar elementos se recorre de atrás hacia adelante para no
+        // desplazar el siguiente índice ni acceder fuera del arreglo.
+        for i = l.prices.size() - 1 to 0
+            if l.direction < 0 and l.prices.get(i) < low
+                l.eliminate(i)
+            if l.direction > 0 and l.prices.get(i) > high
+                l.eliminate(i)
+
+method sqz(liquidation l) =>
+    bool sqz = false
+    bool proceed = true
+    if l.liq.size() > 0 and start_time_cond
+        for i = l.liq.size() - 1 to 0
+            if bar_index == l.liq.get(i).lvl.get_right()
+                if proceed
+                    condition = l.direction > 0 ? low < l.prices.get(i) : high > l.prices.get(i)
+                    if not condition
+                        proceed := false
+                        l.liq.get(i).lvl.set_right(bar_index + 1)
+                    if condition
+                        sqz := true
+                        l.liq.remove(i)
+                        l.prices.remove(i)
+                if not proceed
+                    l.liq.get(i).lvl.set_right(bar_index + 1)
+    sqz
+
+method sort(liquidation l) =>
+    if l.prices.size() > 0
+        order_dir = l.direction > 0 ? order.ascending : order.descending
+        int[] new_idx = l.prices.sort_indices(order_dir)
+        liq_lvl[] new_liq = array.new<liq_lvl>(l.prices.size())
+        for i = 0 to l.prices.size() - 1
+            j = new_idx.get(i)
+            new_liq.set(i, l.liq.get(j))
+        for i = 0 to l.prices.size() - 1
+            l.liq.set(i, new_liq.get(i))
+        l.prices.sort(order_dir)
+
+method max_contracts(liq_lvl[] liq) =>
+    float m = 0
+    if liq.size() > 0
+        for i = 0 to liq.size() - 1
+            m := math.max(m, liq.get(i).contracts)
+    m
+
+method gradient(liquidation l, float contracts) =>
+    float mx = l.liq.max_contracts()
+    color.new(color.from_gradient(mx > 0 ? math.pow(contracts, liq_gamma) : 0, 0, mx > 0 ? math.pow(mx, liq_gamma) : 1, liq_btm_color, liq_top_color), liq_transp)
+
+method update_color(liq_lvl[] liq) =>
+    float m = liq.max_contracts()
+    float mg = m > 0 ? math.pow(m, liq_gamma) : 1
+    if liq.size() > 0
+        for i = 0 to liq.size() - 1
+            float cn = m > 0 ? math.pow(liq.get(i).contracts, liq_gamma) : 0
+            float intensity = mg > 0 ? cn / mg : 0
+            c = color.from_gradient(cn, 0, mg, liq_btm_color, liq_top_color)
+            box b = liq.get(i).lvl
+            b.set_bgcolor(c)
+            b.set_border_color(c)
+            // Altura dinámica: los clusters intensos se dibujan GRUESOS
+            // (estilo Coinglass). Se recentra sobre el precio del nivel.
+            float mid = (b.get_top() + b.get_bottom()) / 2
+            float half = scale * (0.5 + liq_height_boost * intensity) / 2
+            b.set_top(mid + half)
+            b.set_bottom(mid - half)
+            // Fondo semitransparente (velas visibles a través) + borde más
+            // sólido para marcar el nivel exacto de liquidación
+            b.set_border_color(color.new(c, math.max(0, liq_transp - 35)))
+
+get_lvl(float top, float btm, color lvl_color) =>
+    box.new(math.max(0, bar_index - liq_extend), top, bar_index, btm, lvl_color, 2, line.style_solid, bgcolor=lvl_color, force_overlay=true)
+
+get_liq_price(float price, int lev, int dir) =>
+    price * (1 - dir * (1.0 / lev))
+
+get_extremes(float value) =>
+    float btm = math.floor(value / scale) * scale
+    float top = btm + scale
+    [top, btm]
+
+method get_liquidation_levels(liquidation longs, liquidation shorts, int lev1, int lev2, int lev3, float disp) =>
+    if start_time_cond
+        lev = lev1 + lev2 + lev3
+        liq_bar[] intrabar = request.security_lower_tf(syminfo.tickerid, ltf, liq_bar.new(high, open, close, low, oid))
+        if intrabar.size() > 0 and oid_cond and lev > 0
+            // Tope de seguridad: en temporalidades altas el número de intrabarras
+            // puede dispararse (una vela mensual = ~8.000 barras de 5m). Procesar
+            // como máximo las 600 más recientes evita el RE10022 sin perder
+            // información relevante del lado actual del mercado.
+            int max_ib = math.min(intrabar.size(), 600)
+            for i = 0 to max_ib - 1
+                _open = intrabar.get(i).o
+                _high = intrabar.get(i).h
+                _close = intrabar.get(i).c
+                _low = intrabar.get(i).l
+                _contracts = intrabar.get(i).contracts
+                low_src = (_low + _open) / 2
+                high_src = (_high + _open) / 2
+                if _contracts > 0
+                    if _close > _open
+                        if lev1 > 0
+                            price = get_liq_price(low_src, lev1, 1)
+                            contracts = _contracts * (1 - disp) * (lev1 / lev)
+                            [l1_top, l1_btm] = get_extremes(price)
+                            longs.add(get_lvl(l1_top, l1_btm, longs.gradient(contracts)), contracts, l1_top)
+                        if lev2 > 0
+                            price = get_liq_price(low_src, lev2, 1)
+                            contracts = _contracts * (1 - disp) * (lev2 / lev)
+                            [l2_top, l2_btm] = get_extremes(price)
+                            longs.add(get_lvl(l2_top, l2_btm, longs.gradient(contracts)), contracts, l2_top)
+                        if lev3 > 0
+                            price = get_liq_price(low_src, lev3, 1)
+                            contracts = _contracts * (1 - disp) * (lev3 / lev)
+                            [l3_top, l3_btm] = get_extremes(price)
+                            longs.add(get_lvl(l3_top, l3_btm, longs.gradient(contracts)), contracts, l3_top)
+                        if disp > 0
+                            if lev1 > 0
+                                price = get_liq_price(high_src, lev1, -1)
+                                contracts = _contracts * disp * (lev1 / lev)
+                                [s1_top, s1_btm] = get_extremes(price)
+                                shorts.add(get_lvl(s1_top, s1_btm, shorts.gradient(contracts)), contracts, s1_btm)
+                            if lev2 > 0
+                                price = get_liq_price(high_src, lev2, -1)
+                                contracts = _contracts * disp * (lev2 / lev)
+                                [s2_top, s2_btm] = get_extremes(price)
+                                shorts.add(get_lvl(s2_top, s2_btm, shorts.gradient(contracts)), contracts, s2_btm)
+                            if lev3 > 0
+                                price = get_liq_price(high_src, lev3, -1)
+                                contracts = _contracts * disp * (lev3 / lev)
+                                [s3_top, s3_btm] = get_extremes(price)
+                                shorts.add(get_lvl(s3_top, s3_btm, shorts.gradient(contracts)), contracts, s3_btm)
+                    if _close < _open
+                        if lev1 > 0
+                            price = get_liq_price(high_src, lev1, -1)
+                            contracts = _contracts * (1 - disp) * (lev1 / lev)
+                            [s1_top, s1_btm] = get_extremes(price)
+                            shorts.add(get_lvl(s1_top, s1_btm, shorts.gradient(contracts)), contracts, s1_btm)
+                        if lev2 > 0
+                            price = get_liq_price(high_src, lev2, -1)
+                            contracts = _contracts * (1 - disp) * (lev2 / lev)
+                            [s2_top, s2_btm] = get_extremes(price)
+                            shorts.add(get_lvl(s2_top, s2_btm, shorts.gradient(contracts)), contracts, s2_btm)
+                        if lev3 > 0
+                            price = get_liq_price(high_src, lev3, -1)
+                            contracts = _contracts * (1 - disp) * (lev3 / lev)
+                            [s3_top, s3_btm] = get_extremes(price)
+                            shorts.add(get_lvl(s3_top, s3_btm, shorts.gradient(contracts)), contracts, s3_btm)
+                        if disp > 0
+                            if lev1 > 0
+                                price = get_liq_price(low_src, lev1, 1)
+                                contracts = _contracts * disp * (lev1 / lev)
+                                [l1_top, l1_btm] = get_extremes(price)
+                                longs.add(get_lvl(l1_top, l1_btm, longs.gradient(contracts)), contracts, l1_top)
+                            if lev2 > 0
+                                price = get_liq_price(low_src, lev2, 1)
+                                contracts = _contracts * disp * (lev2 / lev)
+                                [l2_top, l2_btm] = get_extremes(price)
+                                longs.add(get_lvl(l2_top, l2_btm, longs.gradient(contracts)), contracts, l2_top)
+                            if lev3 > 0
+                                price = get_liq_price(low_src, lev3, 1)
+                                contracts = _contracts * disp * (lev3 / lev)
+                                [l3_top, l3_btm] = get_extremes(price)
+                                longs.add(get_lvl(l3_top, l3_btm, longs.gradient(contracts)), contracts, l3_top)
+            // Recolorear una vez por vela, no por cada intrabar. En marcos
+            // altos esto evita cientos de recorridos completos por vela.
+            longs.liq.update_color()
+            shorts.liq.update_color()
+
+var liquidation longs = liquidation.new(array.new<liq_lvl>(), array.new<float>(), 1)
+var liquidation shorts = liquidation.new(array.new<liq_lvl>(), array.new<float>(), -1)
+
+if show_heatmap
+    get_liquidation_levels(longs, shorts, lev1, lev2, lev3, disp)
+    longs.correct_history()
+    shorts.correct_history()
+    longs.sort()
+    shorts.sort()
+
+l_sqz = show_heatmap ? longs.sqz() : false
+s_sqz = show_heatmap ? shorts.sqz() : false
+
+// Niveles de liquidez más cercanos (para la tabla y lógica)
+f_nearest_below(float[] prices, float ref) =>
+    float result = na
+    if prices.size() > 0
+        for i = prices.size() - 1 to 0
+            p = prices.get(i)
+            if p < ref
+                result := p
+                break
+    result
+
+f_nearest_above(float[] prices, float ref) =>
+    float result = na
+    if prices.size() > 0
+        for i = prices.size() - 1 to 0
+            p = prices.get(i)
+            if p > ref
+                result := p
+                break
+    result
+
+near_long_liq = show_heatmap ? f_nearest_below(longs.prices, close) : na
+near_short_liq = show_heatmap ? f_nearest_above(shorts.prices, close) : na
+liq_long_pct = not na(near_long_liq) ? (near_long_liq - close) / close * 100 : na
+liq_short_pct = not na(near_short_liq) ? (near_short_liq - close) / close * 100 : na
+
+// ═══ FILTROS EXTRA: ADX + VETO POR LIQUIDEZ ═══
+// ADX mide la FUERZA de la tendencia (no su dirección): evita entradas en
+// rangos laterales donde los breakouts fallan en cadena.
+[diplus, diminus, adx_val] = ta.dmi(adx_len, adx_len)
+adx_ok = not enable_adx_filter or adx_val >= adx_min
+
+// VETO POR LIQUIDEZ: no entrar si tu stop quedaría DENTRO de un cluster de
+// liquidaciones del lado contrario — el precio irá a barrerlo antes de despegar.
+veto_stop_dist = risk_method == 'ATR' ? atr * atr_multiplier : close * (stop_loss_percent / 100)
+liq_veto_long = enable_liq_veto and show_heatmap and not na(near_long_liq) and (close - near_long_liq) < veto_stop_dist * liq_veto_mult
+liq_veto_short = enable_liq_veto and show_heatmap and not na(near_short_liq) and (near_short_liq - close) < veto_stop_dist * liq_veto_mult
 
 // ============================================
 // SISTEMA DE SEÑALES
 // ============================================
-
 bullish_trend = use_2_emas ? (ema_fast_line > ema_slow_line) : (ema_fast_line > ema_medium_line and ema_medium_line > ema_slow_line)
 bearish_trend = use_2_emas ? (ema_fast_line < ema_slow_line) : (ema_fast_line < ema_medium_line and ema_medium_line < ema_slow_line)
 macd_bullish = macd > signal_line
@@ -172,120 +883,166 @@ macd_bearish = macd < signal_line
 sqz_bullish = val_sqz > 0 and val_sqz > nz(val_sqz[1])
 sqz_bearish = val_sqz < 0 and val_sqz < nz(val_sqz[1])
 
-// Señales MEJORADAS con filtros Fase 1
 buy_conservative = bullish_trend and macd_bullish and sqz_bullish and rsi <= 30 and breakout_long and not near_resistance
 sell_conservative = bearish_trend and macd_bearish and sqz_bearish and rsi >= 70 and breakdown_short and not near_support
-
 buy_balanced = bullish_trend and macd_bullish and sqz_bullish and rsi_ok_long and breakout_long and not near_resistance
 sell_balanced = bearish_trend and macd_bearish and sqz_bearish and rsi_ok_short and breakdown_short and not near_support
 
-buy_signal = signal_mode == "Conservador" ? buy_conservative : buy_balanced
-sell_signal = signal_mode == "Conservador" ? sell_conservative : sell_balanced
+confirmed = wait_close ? barstate.isconfirmed : true
+// Patrones: gatillo + confirmación de cierre (anti-repintado). Se desarman al disparar.
+pat_hch_short = pat_hch_short_raw and confirmed
+pat_2t_short = pat_2t_short_raw and confirmed
+pat_hsi_long = pat_hsi_long_raw and confirmed
+pat_2b_long = pat_2b_long_raw and confirmed
+if pat_hch_short
+    hch_armed := false
+if pat_2t_short
+    dt_armed := false
+if pat_hsi_long
+    hsi_armed := false
+if pat_2b_long
+    db_armed := false
+wyck_spring_long = show_wyckoff and spring_sig and confirmed
+wyck_test_long = show_wyckoff and test_spring_raw and confirmed
+wyck_upthrust_short = show_wyckoff and upthrust_sig and confirmed
+wyck_test_short = show_wyckoff and test_upthrust_raw and confirmed
+// ── Plan de trade de la última señal de patrón/Wyckoff ──
+// Entrada = cierre de la vela señal. SL = extremo del patrón + 0.5 ATR de
+// colchón. TP = R/R objetivo sobre el riesgo.
+var float sig_e = na
+var float sig_sl = na
+var float sig_tp = na
+var string sig_name = ''
+var string sig_dir = ''
+var int sig_bar2 = na
+if pat_2b_long
+    sig_name := 'Doble suelo', sig_dir := 'LONG ↑', sig_e := close
+    sig_sl := db_bot - atr * 0.5
+    sig_tp := close + (close - sig_sl) * pat_rr_mult
+    sig_bar2 := bar_index
+if pat_hsi_long
+    sig_name := 'HCH invertida', sig_dir := 'LONG ↑', sig_e := close
+    sig_sl := pl_b - atr * 0.5
+    sig_tp := close + (close - sig_sl) * pat_rr_mult
+    sig_bar2 := bar_index
+if pat_2t_short
+    sig_name := 'Doble techo', sig_dir := 'SHORT ↓', sig_e := close
+    sig_sl := dt_top + atr * 0.5
+    sig_tp := close - (sig_sl - close) * pat_rr_mult
+    sig_bar2 := bar_index
+if pat_hch_short
+    sig_name := 'HCH', sig_dir := 'SHORT ↓', sig_e := close
+    sig_sl := ph_b + atr * 0.5
+    sig_tp := close - (sig_sl - close) * pat_rr_mult
+    sig_bar2 := bar_index
+if wyck_spring_long
+    sig_name := 'Spring', sig_dir := 'LONG ↑', sig_e := close
+    sig_sl := spring_low - atr * 0.5
+    sig_tp := close + (close - sig_sl) * pat_rr_mult
+    sig_bar2 := bar_index
+if wyck_test_long
+    sig_name := 'Test Spring', sig_dir := 'LONG ↑', sig_e := close
+    sig_sl := low - atr * 0.5
+    sig_tp := close + (close - sig_sl) * pat_rr_mult
+    sig_bar2 := bar_index
+if wyck_upthrust_short
+    sig_name := 'Upthrust', sig_dir := 'SHORT ↓', sig_e := close
+    sig_sl := upthrust_high + atr * 0.5
+    sig_tp := close - (sig_sl - close) * pat_rr_mult
+    sig_bar2 := bar_index
+if wyck_test_short
+    sig_name := 'Test Upthrust', sig_dir := 'SHORT ↓', sig_e := close
+    sig_sl := high + atr * 0.5
+    sig_tp := close - (sig_sl - close) * pat_rr_mult
+    sig_bar2 := bar_index
+fib_long = show_fib and fib_long_raw and confirmed
+fib_short = show_fib and fib_short_raw and confirmed
+if fib_long
+    sig_name := 'Retroceso', sig_dir := 'LONG ↑', sig_e := close
+    sig_sl := low - atr * 0.5
+    sig_tp := close + (close - sig_sl) * pat_rr_mult
+    sig_bar2 := bar_index
+if fib_short
+    sig_name := 'Retroceso', sig_dir := 'SHORT ↓', sig_e := close
+    sig_sl := high + atr * 0.5
+    sig_tp := close - (sig_sl - close) * pat_rr_mult
+    sig_bar2 := bar_index
+fvg_long = show_fvg and fvg_long_raw and confirmed
+fvg_short = show_fvg and fvg_short_raw and confirmed
+if fvg_long
+    sig_name := 'FVG', sig_dir := 'LONG ↑', sig_e := close
+    sig_sl := low - atr * 0.5
+    sig_tp := close + (close - sig_sl) * pat_rr_mult
+    sig_bar2 := bar_index
+if fvg_short
+    sig_name := 'FVG', sig_dir := 'SHORT ↓', sig_e := close
+    sig_sl := high + atr * 0.5
+    sig_tp := close - (sig_sl - close) * pat_rr_mult
+    sig_bar2 := bar_index
+
+// ── RESULTADO de la señal de patrón (evita mostrar planes caducados) ──
+var string sig_res = ''
+var int sig_res_bar = na
+// Una señal nueva reinicia el seguimiento
+if sig_bar2 == bar_index
+    sig_res := ''
+    sig_res_bar := na
+// SL/TP se evalúan desde la vela SIGUIENTE a la señal (la entrada es al cierre)
+if sig_res == '' and bar_index > nz(sig_bar2) and not na(sig_sl)
+    if sig_dir == 'LONG ↑'
+        if low <= sig_sl
+            sig_res := '❌ SL'
+            sig_res_bar := bar_index
+        else if high >= sig_tp
+            sig_res := '✅ TP'
+            sig_res_bar := bar_index
+    else
+        if high >= sig_sl
+            sig_res := '❌ SL'
+            sig_res_bar := bar_index
+        else if low <= sig_tp
+            sig_res := '✅ TP'
+            sig_res_bar := bar_index
+
+var string last_wyck = '—'
+var int last_wyck_bar = na
+if wyck_spring_long
+    last_wyck := 'Spring ↑'
+    last_wyck_bar := bar_index
+if wyck_test_long
+    last_wyck := 'Test ↑'
+    last_wyck_bar := bar_index
+if wyck_upthrust_short
+    last_wyck := 'Upthrust ↓'
+    last_wyck_bar := bar_index
+if wyck_test_short
+    last_wyck := 'Test ↓'
+    last_wyck_bar := bar_index
+if er_long and confirmed
+    last_wyck := 'Absorción ↑'
+    last_wyck_bar := bar_index
+if er_short and confirmed
+    last_wyck := 'Absorción ↓'
+    last_wyck_bar := bar_index
+// Estado/alertas = modo elegido + confirmación + ADX + veto de liquidez
+buy_signal = (signal_mode == 'Conservador' ? buy_conservative : buy_balanced) and confirmed and adx_ok and not liq_veto_long
+sell_signal = (signal_mode == 'Conservador' ? sell_conservative : sell_balanced) and confirmed and adx_ok and not liq_veto_short
 
 // ============================================
-// GESTIÓN DE RIESGO
+// GESTIÓN DE RIESGO + ENTRADAS/SALIDAS
 // ============================================
-
-float stop_distance = risk_method == "ATR" ? atr * atr_multiplier : close * (stop_loss_percent / 100)
-float tp_distance = stop_distance * take_profit_multiplier
-
+stop_distance = risk_method == 'ATR' ? atr * atr_multiplier : close * (stop_loss_percent / 100)
+tp_distance = stop_distance * take_profit_multiplier
 stop_loss_buy_ref = low - stop_distance
 stop_loss_sell_ref = high + stop_distance
 
-// RESETEO ULTRA-COMPLETO
-if position_is_long and not na(last_sl_long) and not na(last_tp_long)
-    if close <= last_sl_long or close >= last_tp_long
-        position_is_long := false
-        last_entry_price_long := na
-        last_sl_long := na
-        last_tp_long := na
-        last_rr_long := na
-        activation_rsi_long := na
-        activation_price_long := na
-    else if bearish_trend
-        position_is_long := false
-        last_entry_price_long := na
-        last_sl_long := na
-        last_tp_long := na
-        last_rr_long := na
-        activation_rsi_long := na
-        activation_price_long := na
-    else if macd_bearish
-        position_is_long := false
-        last_entry_price_long := na
-        last_sl_long := na
-        last_tp_long := na
-        last_rr_long := na
-        activation_rsi_long := na
-        activation_price_long := na
-    else if rsi > 65
-        position_is_long := false
-        last_entry_price_long := na
-        last_sl_long := na
-        last_tp_long := na
-        last_rr_long := na
-        activation_rsi_long := na
-        activation_price_long := na
+long_exit = position_is_long and not na(last_sl_long) and not na(last_tp_long) and (close <= last_sl_long or close >= last_tp_long or bearish_trend or macd_bearish or rsi > rsi_exit_long)
+short_exit = position_is_short and not na(last_sl_short) and not na(last_tp_short) and (close >= last_sl_short or close <= last_tp_short or bullish_trend or macd_bullish or rsi < rsi_exit_short)
 
-if position_is_short and not na(last_sl_short) and not na(last_tp_short)
-    if close >= last_sl_short or close <= last_tp_short
-        position_is_short := false
-        last_entry_price_short := na
-        last_sl_short := na
-        last_tp_short := na
-        last_rr_short := na
-        activation_rsi_short := na
-        activation_price_short := na
-    else if bullish_trend
-        position_is_short := false
-        last_entry_price_short := na
-        last_sl_short := na
-        last_tp_short := na
-        last_rr_short := na
-        activation_rsi_short := na
-        activation_price_short := na
-    else if macd_bullish
-        position_is_short := false
-        last_entry_price_short := na
-        last_sl_short := na
-        last_tp_short := na
-        last_rr_short := na
-        activation_rsi_short := na
-        activation_price_short := na
-    else if rsi < 35
-        position_is_short := false
-        last_entry_price_short := na
-        last_sl_short := na
-        last_tp_short := na
-        last_rr_short := na
-        activation_rsi_short := na
-        activation_price_short := na
-
-if buy_signal
-    position_is_long := true
-    position_is_short := false
-    last_entry_price_long := close
-    last_sl_long := close - stop_distance
-    last_tp_long := close + tp_distance
-    last_rr_long := tp_distance / stop_distance
-    activation_rsi_long := rsi
-    activation_price_long := close
-    last_entry_price_short := na
-    last_sl_short := na
-    last_tp_short := na
-    last_rr_short := na
-    activation_rsi_short := na
-    activation_price_short := na
-    
-if sell_signal
-    position_is_short := true
+// Se reasignan las variables globales una por una. Una tupla con "=" dentro
+// de un if declaraba variables locales y dejaba el estado real sin resetear.
+if long_exit or sell_signal
     position_is_long := false
-    last_entry_price_short := close
-    last_sl_short := close + stop_distance
-    last_tp_short := close - tp_distance
-    last_rr_short := tp_distance / stop_distance
-    activation_rsi_short := rsi
-    activation_price_short := close
     last_entry_price_long := na
     last_sl_long := na
     last_tp_long := na
@@ -293,135 +1050,252 @@ if sell_signal
     activation_rsi_long := na
     activation_price_long := na
 
+if short_exit or buy_signal
+    position_is_short := false
+    last_entry_price_short := na
+    last_sl_short := na
+    last_tp_short := na
+    last_rr_short := na
+    activation_rsi_short := na
+    activation_price_short := na
+
+if buy_signal and not position_is_long
+    position_is_long := true
+    last_entry_price_long := close
+    last_sl_long := close - stop_distance
+    last_tp_long := close + tp_distance
+    last_rr_long := stop_distance > 0 ? tp_distance / stop_distance : na
+    activation_rsi_long := rsi
+    activation_price_long := close
+
+if sell_signal and not position_is_short
+    position_is_short := true
+    last_entry_price_short := close
+    last_sl_short := close + stop_distance
+    last_tp_short := close - tp_distance
+    last_rr_short := stop_distance > 0 ? tp_distance / stop_distance : na
+    activation_rsi_short := rsi
+    activation_price_short := close
+
 // ============================================
-// PLOTS GRÁFICO PRINCIPAL (force_overlay)
+// PLOTS SOBRE PRECIOS (force_overlay)
 // ============================================
+// Nota: ema_fast_line y ema_slow_line son las MISMAS series en ambos modos
+// (la selección de longitud ya ocurre en su definición) → 3 plots bastan.
+// linewidth debe ser constante en Pine v6 (no admite expresiones).
+plot(show_ema ? ema_fast_line : na, 'EMA Rápida (7/100 auto)', color=#2962FF, linewidth=2, force_overlay=true)
+plot(show_ema ? ema_slow_line : na, 'EMA Lenta (25/200 auto)', color=#00C853, linewidth=2, force_overlay=true)
+plot(show_ema and not use_2_emas ? ema_medium_line : na, 'EMA Media', color=#FF6D00, linewidth=2, force_overlay=true)
+pivot_near = near_resistance ? last_ph : near_support ? last_pl : na(last_ph) ? last_pl : na(last_pl) ? last_ph : (close - last_pl < last_ph - close ? last_pl : last_ph)
+plot(show_pivot_levels and enable_pivot_filter ? pivot_near : na, 'Nivel Pivot (cercano)', color=pivot_near == last_ph and not na(last_ph) ? color.new(color.red, 50) : color.new(color.green, 50), style=plot.style_circles, linewidth=1, force_overlay=true)
+stop_ref_val = bullish_trend ? stop_loss_buy_ref : bearish_trend ? stop_loss_sell_ref : na
+plot(show_risk_management ? stop_ref_val : na, 'Stop Ref', color=bullish_trend ? color.new(color.red, 60) : color.new(color.blue, 60), linewidth=1, style=plot.style_circles, force_overlay=true)
 
-// Solución al error de linewidth: usar plots condicionales separados para cada modo
-// Modo 2 EMAs Largas (linewidth más grueso)
-plot(show_ema and use_2_emas ? ema_fast_line : na, "EMA Rápida Larga", color=#2962FF, linewidth=3, force_overlay=true)
-plot(show_ema and use_2_emas ? ema_slow_line : na, "EMA Lenta Larga", color=#00C853, linewidth=3, force_overlay=true)
+// Ambas familias SIEMPRE visibles — no hace falta cambiar de modo para verlas.
+// Círculos = Equilibrado (más frecuentes) · Triángulos 💠 = Premium (RSI<=30/>=70, raras)
+plot(show_signals and show_sig_bal and buy_balanced and confirmed ? close : na, 'Señal COMPRA (Equilibrado)', color=color.new(color.lime, 0), linewidth=2, style=plot.style_circles, force_overlay=true)
+plot(show_signals and show_sig_bal and sell_balanced and confirmed ? close : na, 'Señal VENTA (Equilibrado)', color=color.new(color.orange, 0), linewidth=2, style=plot.style_circles, force_overlay=true)
+plotshape(show_signals and show_sig_prem and buy_conservative and confirmed, '💠 COMPRA Premium', shape.triangleup, location.belowbar, #00E5FF, size=size.normal, force_overlay=true)
+plotshape(show_signals and show_sig_prem and sell_conservative and confirmed, '🛑 VENTA Premium', shape.triangledown, location.abovebar, #FF1744, size=size.normal, force_overlay=true)
 
-// Modo 3 EMAs Cortas (linewidth normal)
-plot(show_ema and not use_2_emas ? ema_fast_line : na, "EMA Rápida", color=#2962FF, linewidth=2, force_overlay=true)
-plot(show_ema and not use_2_emas ? ema_medium_line : na, "EMA Media", color=#FF6D00, linewidth=2, force_overlay=true)
-plot(show_ema and not use_2_emas ? ema_slow_line : na, "EMA Lenta", color=#00C853, linewidth=2, force_overlay=true)
+// ── Señales de PATRONES (apartado independiente de los indicadores) ──
+plotshape(show_patterns and pat_2b_long, '📐 Doble suelo → LONG', style=shape.diamond, location=location.belowbar, color=#FF6D00, size=size.normal, text='2S', textcolor=color.white, force_overlay=true)
+plotshape(show_patterns and pat_hsi_long, '📐 HCH invertida → LONG', style=shape.diamond, location=location.belowbar, color=#FF6D00, size=size.normal, text='HCHi', textcolor=color.white, force_overlay=true)
+plotshape(show_patterns and pat_2t_short, '📐 Doble techo → SHORT', style=shape.diamond, location=location.abovebar, color=#EC407A, size=size.normal, text='2T', textcolor=color.white, force_overlay=true)
+plotshape(show_patterns and pat_hch_short, '📐 HCH → SHORT', style=shape.diamond, location=location.abovebar, color=#EC407A, size=size.normal, text='HCH', textcolor=color.white, force_overlay=true)
 
-plot(show_risk_management and bullish_trend ? stop_loss_buy_ref : na, "Stop Buy Ref", color=color.new(color.red, 60), linewidth=1, style=plot.style_circles, force_overlay=true)
-plot(show_risk_management and bearish_trend ? stop_loss_sell_ref : na, "Stop Sell Ref", color=color.new(color.blue, 60), linewidth=1, style=plot.style_circles, force_overlay=true)
+// ── Señales de WYCKOFF (apartado independiente) ──
+plotshape(wyck_spring_long, '🌀 Spring → LONG', style=shape.circle, location=location.belowbar, color=#00E676, size=size.normal, text='SP', textcolor=color.black, force_overlay=true)
+plotshape(wyck_test_long, '🌀 Test de Spring → LONG', style=shape.circle, location=location.belowbar, color=#69F0AE, size=size.small, text='T', textcolor=color.black, force_overlay=true)
+plotshape(wyck_upthrust_short, '🌀 Upthrust → SHORT', style=shape.circle, location=location.abovebar, color=#FF1744, size=size.normal, text='UT', textcolor=color.white, force_overlay=true)
+plotshape(wyck_test_short, '🌀 Test de Upthrust → SHORT', style=shape.circle, location=location.abovebar, color=#FF8A80, size=size.small, text='T', textcolor=color.black, force_overlay=true)
+plotshape(fib_long, '🌊 Retroceso → LONG', style=shape.triangleup, location=location.belowbar, color=#FFD600, size=size.normal, text='FR', textcolor=color.black, force_overlay=true)
+plotshape(fib_short, '🌊 Retroceso → SHORT', style=shape.triangledown, location=location.abovebar, color=#FFD600, size=size.normal, text='FR', textcolor=color.black, force_overlay=true)
+plotshape(fvg_long, '🕳️ FVG → LONG', style=shape.square, location=location.belowbar, color=#00B0FF, size=size.small, text='FVG', textcolor=color.black, force_overlay=true)
+plotshape(fvg_short, '🕳️ FVG → SHORT', style=shape.square, location=location.abovebar, color=#00B0FF, size=size.small, text='FVG', textcolor=color.black, force_overlay=true)
 
-is_equilibrado = signal_mode == "Equilibrado"
-plot(show_signals and is_equilibrado and buy_signal ? close : na, "Señal COMPRA", color=color.new(color.lime, 0), linewidth=2, style=plot.style_circles, force_overlay=true)
-plot(show_signals and is_equilibrado and sell_signal ? close : na, "Señal VENTA", color=color.new(color.orange, 0), linewidth=2, style=plot.style_circles, force_overlay=true)
-
-is_conservador = signal_mode == "Conservador"
-plotshape(show_signals and is_conservador and buy_signal, "🟢 COMPRA", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.normal, force_overlay=true)
-plotshape(show_signals and is_conservador and sell_signal, "🔴 VENTA", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.normal, force_overlay=true)
+// ═══ NORMALIZACIÓN DE ESCALAS DEL PANEL ═══
+// Un solo panel = un solo eje de precios. Las liquidaciones agregadas de BTC
+// valen miles/millones de unidades y aplastan al SQZMOM (unidades de ~±3).
+// Solución: re-escalar cada serie a la volatilidad (desv. estándar) del SQZMOM.
+// El factor es siempre positivo → la forma, los ceros y los cruces se conservan.
+norm_ref = ta.stdev(val_sqz, 100)
+f_norm(float src) =>
+    s = ta.stdev(src, 100)
+    raw = normalize_panels and not na(s) and s > 0 ? src / s * norm_ref : src
+    // Clamp: un pico de liquidaciones (15-20 sigma) estiraría el autoscale
+    // del panel y aplastaría al SQZMOM contra el cero. Se acota a un múltiplo
+    // de la volatilidad del SQZMOM. Factor positivo → forma y ceros se conservan.
+    cap = liq_clamp_mult * norm_ref
+    normalize_panels and not na(cap) and cap > 0 ? math.max(-cap, math.min(cap, raw)) : raw
 
 // ============================================
-// PANEL INFERIOR: SQZMOM y MACD
+// PANEL: SQZMOM + MACD
 // ============================================
-
 bcolor = val_sqz > 0 ? (val_sqz > nz(val_sqz[1]) ? color.lime : color.green) : (val_sqz < nz(val_sqz[1]) ? color.red : color.maroon)
 scolor = noSqz ? color.blue : sqzOn ? color.black : color.gray
-
-plot(show_sqz ? val_sqz : na, "SQZMOM", color=bcolor, style=plot.style_histogram, linewidth=4)
-plot(show_sqz ? 0 : na, "SQZ Zero", color=scolor, style=plot.style_cross, linewidth=2)
-hline(0, "SQZ Baseline", color=color.new(color.gray, 70), linestyle=hline.style_solid)
+plot(show_sqz ? val_sqz : na, 'SQZMOM', color=bcolor, style=plot.style_histogram, linewidth=4)
+plot(show_sqz ? 0 : na, 'SQZ Zero', color=scolor, style=plot.style_cross, linewidth=2)
+hline(0, 'SQZ Baseline', color=color.new(color.gray, 70))
 
 hist_color = histogram >= 0 ? (histogram[1] < histogram ? #26A69A : #B2DFDB) : (histogram[1] < histogram ? #FFCDD2 : #FF5252)
+plot(show_macd ? f_norm(macd) : na, 'MACD', color=#2962FF, linewidth=2)
+plot(show_macd ? f_norm(signal_line) : na, 'Signal', color=#FF6D00, linewidth=2)
+plot(show_macd ? f_norm(histogram) : na, 'Histogram', style=plot.style_columns, color=hist_color, linewidth=3)
+hline(0, 'MACD Zero', color=color.new(color.gray, 70))
 
-plot(show_macd ? macd : na, "MACD", color=#2962FF, linewidth=2)
-plot(show_macd ? signal_line : na, "Signal", color=#FF6D00, linewidth=2)
-plot(show_macd ? histogram : na, "Histogram", style=plot.style_columns, color=hist_color, linewidth=3)
-hline(0, "MACD Zero", color=color.new(color.gray, 70), linestyle=hline.style_solid)
+
+
+// ═══════════════════════════════════════════════════════════
+// MÓDULO 3 · LIQUIDACIONES AGREGADAS REALES (adaptado de BLZRtek)
+// Histograma de liquidaciones ejecutadas en 6 exchanges.
+// Columnas arriba (rojo) = shorts liquidados · abajo (verde) = longs
+// ═══════════════════════════════════════════════════════════
+string base = syminfo.basecurrency
+string tf_aggs = i_tf == '' ? timeframe.period : i_tf
+bool isMajor = base == 'BTC' or base == 'ETH'
+
+f_lq(string sym) =>
+    request.security(sym, tf_aggs, volume, gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+bn_usdt_buy = show_aggs and i_binance ? f_lq('BINANCE:' + base + 'USDT.P_LQBUY') : na
+bn_usdt_sell = show_aggs and i_binance ? f_lq('BINANCE:' + base + 'USDT.P_LQSELL') : na
+bn_usd_buy = show_aggs and i_binance and isMajor ? f_lq('BINANCE:' + base + 'USD.P_LQBUY') : na
+bn_usd_sell = show_aggs and i_binance and isMajor ? f_lq('BINANCE:' + base + 'USD.P_LQSELL') : na
+by_usdt_buy = show_aggs and i_bybit ? f_lq('BYBIT:' + base + 'USDT.P_LQBUY') : na
+by_usdt_sell = show_aggs and i_bybit ? f_lq('BYBIT:' + base + 'USDT.P_LQSELL') : na
+by_usd_buy = show_aggs and i_bybit and isMajor ? f_lq('BYBIT:' + base + 'USD.P_LQBUY') : na
+by_usd_sell = show_aggs and i_bybit and isMajor ? f_lq('BYBIT:' + base + 'USD.P_LQSELL') : na
+okx_usdt_buy = show_aggs and i_okx ? f_lq('OKX:' + base + 'USDT.P_LQBUY') : na
+okx_usdt_sell = show_aggs and i_okx ? f_lq('OKX:' + base + 'USDT.P_LQSELL') : na
+okx_usdc_buy = show_aggs and i_okx and isMajor ? f_lq('OKX:' + base + 'USDC.P_LQBUY') : na
+okx_usdc_sell = show_aggs and i_okx and isMajor ? f_lq('OKX:' + base + 'USDC.P_LQSELL') : na
+bmx_usd_buy = show_aggs and i_bitmex and isMajor ? f_lq('BITMEX:' + base + 'USD.P_LQBUY') : na
+bmx_usd_sell = show_aggs and i_bitmex and isMajor ? f_lq('BITMEX:' + base + 'USD.P_LQSELL') : na
+drb_usdc_buy = show_aggs and i_deribit and isMajor ? f_lq('DERIBIT:' + base + 'USDC.P_LQBUY') : na
+drb_usdc_sell = show_aggs and i_deribit and isMajor ? f_lq('DERIBIT:' + base + 'USDC.P_LQSELL') : na
+drb_usd_buy = show_aggs and i_deribit and isMajor ? f_lq('DERIBIT:' + base + 'USD.P_LQBUY') : na
+drb_usd_sell = show_aggs and i_deribit and isMajor ? f_lq('DERIBIT:' + base + 'USD.P_LQSELL') : na
+htx_usdt_buy = show_aggs and i_htx ? f_lq('HTX:' + base + 'USDT.P_LQBUY') : na
+htx_usdt_sell = show_aggs and i_htx ? f_lq('HTX:' + base + 'USDT.P_LQSELL') : na
+
+float tf_open = request.security(syminfo.tickerid, tf_aggs, open, barmerge.gaps_on, barmerge.lookahead_off)
+f_fromUSD(float val) => nz(val) / nz(tf_open, open)
+
+float shortLiqBase = nz(bn_usdt_buy) + nz(by_usdt_buy) + nz(okx_usdt_buy) + nz(okx_usdc_buy) + nz(drb_usdc_buy) + nz(htx_usdt_buy) + f_fromUSD(bn_usd_buy) + f_fromUSD(by_usd_buy) + f_fromUSD(bmx_usd_buy) + f_fromUSD(drb_usd_buy)
+float longLiqBase = nz(bn_usdt_sell) + nz(by_usdt_sell) + nz(okx_usdt_sell) + nz(okx_usdc_sell) + nz(drb_usdc_sell) + nz(htx_usdt_sell) + f_fromUSD(bn_usd_sell) + f_fromUSD(by_usd_sell) + f_fromUSD(bmx_usd_sell) + f_fromUSD(drb_usd_sell)
+
+float shortLiqAcc = math.sum(shortLiqBase, i_window)
+float longLiqAcc = math.sum(longLiqBase, i_window)
+float cloudShort = i_cloud ? math.sum(shortLiqBase, i_cloud_len) : na
+float cloudLong = i_cloud ? math.sum(longLiqBase, i_cloud_len) : na
+
+plot(show_aggs ? f_norm(shortLiqAcc) : na, 'Short Liq (real)', color=i_col_short, style=plot.style_columns, linewidth=3)
+plot(show_aggs ? -f_norm(longLiqAcc) : na, 'Long Liq (real)', color=i_col_long, style=plot.style_columns, linewidth=3)
+pZero = plot(0, display=display.none, editable=false)
+pCloudS = plot(show_aggs and i_cloud ? f_norm(cloudShort) : na, 'Nube Short', color=color.new(i_col_short, 70))
+pCloudL = plot(show_aggs and i_cloud ? -f_norm(cloudLong) : na, 'Nube Long', color=color.new(i_col_long, 70))
+fill(pZero, pCloudS, color=color.new(i_col_short, 85), title='Fill Nube Short')
+fill(pZero, pCloudL, color=color.new(i_col_long, 85), title='Fill Nube Long')
 
 // ============================================
-// TABLA INFORMATIVA
+// TABLA INFORMATIVA (24 filas, incluye liquidez)
 // ============================================
-
-var table info_table = table.new(position.top_left, 2, 21, bgcolor=color.new(#1a1a1a, 10), border_width=2, frame_color=color.new(#00C853, 70), frame_width=2)
+var table info_table = table.new(position.top_left, 2, 20, bgcolor=color.new(#1a1a1a, 10), border_width=1, frame_color=color.new(#00C853, 70), frame_width=1)
 
 if barstate.islast and show_table
-    table.cell(info_table, 0, 0, "📊 CHILAQUIL PRO", text_color=color.white, bgcolor=color.new(#00C853, 30), text_size=size.small)
-    table.cell(info_table, 1, 0, "VALOR", text_color=color.white, bgcolor=color.new(#00C853, 30), text_size=size.small)
-    
-    table.cell(info_table, 0, 1, "Modo Señales", text_color=#00E676, text_size=size.small)
-    mode_display = signal_mode == "Conservador" ? "🔴 Conservador" : "🟡 Equilibrado"
-    table.cell(info_table, 1, 1, mode_display, text_color=#FFC107, text_size=size.small)
-    
-    table.cell(info_table, 0, 2, "EMAs Activas", text_color=#00E676, text_size=size.small)
-    ema_display = use_2_emas ? str.tostring(ema_long_fast) + " / " + str.tostring(ema_long_slow) : str.tostring(ema_fast) + " / " + str.tostring(ema_medium) + " / " + str.tostring(ema_slow)
-    table.cell(info_table, 1, 2, ema_display, text_color=#FFC107, text_size=size.small)
-    
-    table.cell(info_table, 0, 3, "RSI(14)", text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 3, str.tostring(rsi, "#.#"), text_color=rsi > 70 ? #FF5252 : rsi < 30 ? #00E676 : color.white, text_size=size.small)
-    
-    trend_text = bullish_trend ? "🟢 ALCISTA" : bearish_trend ? "🔴 BAJISTA" : "⚪ NEUTRAL"
-    trend_color = bullish_trend ? #00E676 : bearish_trend ? #FF5252 : #FFA726
-    table.cell(info_table, 0, 4, "Tendencia", text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 4, trend_text, text_color=trend_color, text_size=size.small)
-    
-    table.cell(info_table, 0, 5, "MACD", text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 5, macd_bullish ? "🟢 Alcista" : "🔴 Bajista", text_color=macd_bullish ? #00E676 : #FF5252, text_size=size.small)
-    
-    table.cell(info_table, 0, 6, "SQZMOM", text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 6, sqz_bullish ? "🟢 Alcista" : "🔴 Bajista", text_color=sqz_bullish ? #00E676 : #FF5252, text_size=size.small)
-    
-    table.cell(info_table, 0, 7, "━━━ FILTROS FASE 1 ━━━", text_color=#FFC107, text_size=size.small, bgcolor=color.new(#FFC107, 50))
-    table.cell(info_table, 1, 7, " ", text_color=#FFC107, text_size=size.small, bgcolor=color.new(#FFC107, 50))
-    
-    table.cell(info_table, 0, 8, "Breakout (L20)", text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 8, breakout_long ? "🟢 OK" : "🔴 Espera", text_color=breakout_long ? #00E676 : #FF9800, text_size=size.small)
-    
-    table.cell(info_table, 0, 9, "Breakdown (L20)", text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 9, breakdown_short ? "🟢 OK" : "🔴 Espera", text_color=breakdown_short ? #00E676 : #FF9800, text_size=size.small)
-    
-    table.cell(info_table, 0, 10, "Pivots", text_color=#00E676, text_size=size.small)
-    pivot_status = near_resistance or near_support ? (near_resistance ? "⚠️ Resistencia" : "⚠️ Soporte") : "🟢 Libre"
-    table.cell(info_table, 1, 10, pivot_status, text_color=(near_resistance or near_support) ? #FF9800 : #00E676, text_size=size.small)
-    
-    table.cell(info_table, 0, 11, "RSI Contextual", text_color=#00E676, text_size=size.small)
-    rsi_range_text = str.tostring(rsi_min_long) + "-" + str.tostring(rsi_max_long)
-    table.cell(info_table, 1, 11, rsi_range_text, text_color=#FFC107, text_size=size.small)
-    
-    table.cell(info_table, 0, 12, "Método Riesgo", text_color=#FFC107, text_size=size.small)
-    risk_display = risk_method == "ATR" ? "ATR x" + str.tostring(atr_multiplier, "#.#") + " R/R x" + str.tostring(take_profit_multiplier, "#.#") : "% SL:" + str.tostring(stop_loss_percent, "#.#") + " R/R x" + str.tostring(take_profit_multiplier, "#.#")
-    table.cell(info_table, 1, 12, risk_display, text_color=#FFC107, text_size=size.small)
-    
+    // 0: Header (modo + EMAs combinados)
+    table.cell(info_table, 0, 0, '📊 CHILAQUIL PRO', text_color=color.white, bgcolor=color.new(#00C853, 30), text_size=size.small)
+    table.cell(info_table, 1, 0, (signal_mode == 'Conservador' ? '🔴 Conserv.' : '🟡 Equil.') + ' · ' + (use_2_emas ? str.tostring(ema_long_fast) + '/' + str.tostring(ema_long_slow) : str.tostring(ema_fast) + '/' + str.tostring(ema_medium) + '/' + str.tostring(ema_slow)), text_color=#FFC107, bgcolor=color.new(#00C853, 30), text_size=size.small)
+    // 1: Tendencia
+    table.cell(info_table, 0, 1, 'Tendencia', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 1, bullish_trend ? '🟢 ALCISTA' : bearish_trend ? '🔴 BAJISTA' : '⚪ NEUTRAL', text_color=bullish_trend ? #00E676 : bearish_trend ? #FF5252 : #FFA726, text_size=size.small)
+    // 2: RSI + StochRSI juntos
+    table.cell(info_table, 0, 2, 'RSI | Stoch', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 2, str.tostring(rsi, '#.#') + ' | ' + str.tostring(k_stoch, '#.') + '/' + str.tostring(d_stoch, '#.'), text_color=rsi > 70 ? #FF5252 : rsi < 30 ? #00E676 : color.white, text_size=size.small)
+    // 3: MACD + SQZMOM juntos
+    table.cell(info_table, 0, 3, 'MACD | SQZMOM', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 3, (macd_bullish ? '🟢' : '🔴') + ' | ' + (sqz_bullish ? '🟢' : '🔴'), text_color=color.white, text_size=size.small)
+    // 4: FILTROS
+    table.cell(info_table, 0, 4, '── FILTROS ──', text_color=#FFC107, text_size=size.small, bgcolor=color.new(#FFC107, 70))
+    table.cell(info_table, 1, 4, ' ', text_color=#FFC107, text_size=size.small, bgcolor=color.new(#FFC107, 70))
+    // 5: Breakout ambos lados en una fila
+    table.cell(info_table, 0, 5, 'Break L / S', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 5, (breakout_long ? '🟢' : '⛔') + ' / ' + (breakdown_short ? '🟢' : '⛔'), text_color=color.white, text_size=size.small)
+    // 6: Pivots
+    pivot_txt = near_resistance ? '⚠️ Resist ' + str.tostring(res_dist_atr, '#.#') + 'A' : near_support ? '⚠️ Soporte ' + str.tostring(sup_dist_atr, '#.#') + 'A' : '🟢 Libre'
+    table.cell(info_table, 0, 6, 'Pivots', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 6, pivot_txt, text_color=(near_resistance or near_support) ? #FF9800 : #00E676, text_size=size.small)
+    // 7: Riesgo
+    table.cell(info_table, 0, 7, 'Riesgo', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 7, risk_method == 'ATR' ? 'ATR×' + str.tostring(atr_multiplier, '#.#') + ' RR×' + str.tostring(take_profit_multiplier, '#.#') : '%' + str.tostring(stop_loss_percent, '#.#') + ' RR×' + str.tostring(take_profit_multiplier, '#.#'), text_color=#FFC107, text_size=size.small)
+    // 8: POSICIÓN
     is_long_active = position_is_long and not na(last_entry_price_long)
-    
-    table.cell(info_table, 0, 13, "🟢 Open Long", text_color=#4CAF50, text_size=size.small)
-    long_entry_text = is_long_active ? str.tostring(last_entry_price_long, "#.####") + "\n(RSI: " + str.tostring(activation_rsi_long, "#.#") + ")" : "N/A"
-    table.cell(info_table, 1, 13, long_entry_text, bgcolor=is_long_active ? color.new(#4CAF50, 70) : na, text_color=is_long_active ? #4CAF50 : color.gray, text_size=size.small)
-    
-    table.cell(info_table, 0, 14, "🛑 SL Long", text_color=#FF9800, text_size=size.small)
-    table.cell(info_table, 1, 14, is_long_active ? str.tostring(last_sl_long, "#.####") : "N/A", bgcolor=is_long_active ? color.new(#FF9800, 70) : na, text_color=is_long_active ? #FF9800 : color.gray, text_size=size.small)
-    
-    table.cell(info_table, 0, 15, "💰 TP Long", text_color=#9C27B0, text_size=size.small)
-    table.cell(info_table, 1, 15, is_long_active ? str.tostring(last_tp_long, "#.####") : "N/A", bgcolor=is_long_active ? color.new(#9C27B0, 70) : na, text_color=is_long_active ? #9C27B0 : color.gray, text_size=size.small)
-    
     is_short_active = position_is_short and not na(last_entry_price_short)
-
-    table.cell(info_table, 0, 16, "🔴 Open Short", text_color=#F44336, text_size=size.small)
-    short_entry_text = is_short_active ? str.tostring(last_entry_price_short, "#.####") + "\n(RSI: " + str.tostring(activation_rsi_short, "#.#") + ")" : "N/A"
-    table.cell(info_table, 1, 16, short_entry_text, bgcolor=is_short_active ? color.new(#F44336, 70) : na, text_color=is_short_active ? #F44336 : color.gray, text_size=size.small)
-    
-    table.cell(info_table, 0, 17, "🛑 SL Short", text_color=#FF9800, text_size=size.small)
-    table.cell(info_table, 1, 17, is_short_active ? str.tostring(last_sl_short, "#.####") : "N/A", bgcolor=is_short_active ? color.new(#FF9800, 70) : na, text_color=is_short_active ? #FF9800 : color.gray, text_size=size.small)
-    
-    table.cell(info_table, 0, 18, "💰 TP Short", text_color=#9C27B0, text_size=size.small)
-    table.cell(info_table, 1, 18, is_short_active ? str.tostring(last_tp_short, "#.####") : "N/A", bgcolor=is_short_active ? color.new(#9C27B0, 70) : na, text_color=is_short_active ? #9C27B0 : color.gray, text_size=size.small)
-    
-    table.cell(info_table, 0, 19, "📊 R/R Long", text_color=#00BCD4, text_size=size.small)
-    table.cell(info_table, 1, 19, is_long_active ? "1:" + str.tostring(last_rr_long, "#.##") : "N/A", text_color=is_long_active and last_rr_long >= 1.8 ? #00E676 : #FF9800, text_size=size.small)
-    
-    table.cell(info_table, 0, 20, "📊 R/R Short", text_color=#00BCD4, text_size=size.small)
-    table.cell(info_table, 1, 20, is_short_active ? "1:" + str.tostring(last_rr_short, "#.##") : "N/A", text_color=is_short_active and last_rr_short >= 1.8 ? #00E676 : #FF9800, text_size=size.small)
+    table.cell(info_table, 0, 8, '── POSICIÓN ──', text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+    table.cell(info_table, 1, 8, is_long_active ? '🟢 ACTIVA' : is_short_active ? '🔴 ACTIVA' : '—', text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+    // 9: LONG (entrada + R/R + SL/TP en una celda)
+    long_txt = is_long_active ? str.tostring(last_entry_price_long, format.mintick) + ' · R/R 1:' + str.tostring(last_rr_long, '#.##') + ' · RSI ' + str.tostring(activation_rsi_long, '#') + '\nSL ' + str.tostring(last_sl_long, format.mintick) + ' · TP ' + str.tostring(last_tp_long, format.mintick) : 'N/A'
+    table.cell(info_table, 0, 9, '🟢 LONG', text_color=#4CAF50, text_size=size.small)
+    table.cell(info_table, 1, 9, long_txt, text_color=is_long_active ? #4CAF50 : color.gray, text_size=size.small)
+    // 10: SHORT
+    short_txt = is_short_active ? str.tostring(last_entry_price_short, format.mintick) + ' · R/R 1:' + str.tostring(last_rr_short, '#.##') + ' · RSI ' + str.tostring(activation_rsi_short, '#') + '\nSL ' + str.tostring(last_sl_short, format.mintick) + ' · TP ' + str.tostring(last_tp_short, format.mintick) : 'N/A'
+    table.cell(info_table, 0, 10, '🔴 SHORT', text_color=#F44336, text_size=size.small)
+    table.cell(info_table, 1, 10, short_txt, text_color=is_short_active ? #F44336 : color.gray, text_size=size.small)
+    // 11: LIQUIDEZ
+    table.cell(info_table, 0, 11, '── LIQUIDEZ ──', text_color=#bbff00, text_size=size.small, bgcolor=color.new(#bbff00, 75))
+    table.cell(info_table, 1, 11, str.tostring(lev1) + '/' + str.tostring(lev2) + '/' + str.tostring(lev3) + (auto_liq_cfg ? ' auto' : ''), text_color=#bbff00, text_size=size.small, bgcolor=color.new(#bbff00, 75))
+    // 12: Shorts ↑
+    table.cell(info_table, 0, 12, '🎯 Shorts ↑', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 12, not na(near_short_liq) ? str.tostring(near_short_liq, format.mintick) + ' (+' + str.tostring(liq_short_pct, '#.#') + '%)' : show_heatmap ? 'Sin datos' : 'OFF', text_color=#00E676, text_size=size.small)
+    // 13: Longs ↓
+    table.cell(info_table, 0, 13, '🎯 Longs ↓', text_color=#FF5252, text_size=size.small)
+    table.cell(info_table, 1, 13, not na(near_long_liq) ? str.tostring(near_long_liq, format.mintick) + ' (' + str.tostring(liq_long_pct, '#.#') + '%)' : show_heatmap ? 'Sin datos' : 'OFF', text_color=#FF5252, text_size=size.small)
+    // 14: Veto de liquidez
+    veto_txt = liq_veto_long ? '⛔ LONG' : liq_veto_short ? '⛔ SHORT' : '🟢 Libre'
+    table.cell(info_table, 0, 14, '🛡️ Veto Liq', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 14, enable_liq_veto ? veto_txt : 'OFF', text_color=liq_veto_long or liq_veto_short ? #FF5252 : #00E676, text_size=size.small)
+    // 15: Patrones armados / disparados
+    pat_txt = hch_armed ? '⚠️ HCH ↓ SHORT' : dt_armed ? '⚠️ Doble techo ↓ SHORT' : hsi_armed ? '⚠️ HCHi ↑ LONG' : db_armed ? '⚠️ Doble suelo ↑ LONG' : '🟢 Ninguno'
+    table.cell(info_table, 0, 15, '📐 Patrón', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 15, show_patterns ? pat_txt : 'OFF', text_color=(hch_armed or dt_armed or hsi_armed or db_armed) ? #FF9800 : #00E676, text_size=size.small)
+    // 16: Último evento Wyckoff
+    wyck_age = na(last_wyck_bar) ? '' : ' · hace ' + str.tostring(bar_index - last_wyck_bar) + 'v'
+    table.cell(info_table, 0, 16, '🌀 Wyckoff', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 16, show_wyckoff ? last_wyck + wyck_age : 'OFF', text_color=last_wyck == '—' ? #00E676 : #FF9800, text_size=size.small)
+    // 17: Plan completo de la última señal de patrón/Wyckoff
+    sig_age = na(sig_bar2) ? '' : ' · hace ' + str.tostring(bar_index - sig_bar2) + 'v'
+    sig_res_txt = sig_res == '' ? ' → ⏳ ACTIVA' : ' → ' + sig_res + (na(sig_res_bar) ? '' : ' hace ' + str.tostring(bar_index - sig_res_bar) + 'v')
+    sig_txt = na(sig_e) ? '—' : sig_name + ' ' + sig_dir + ' @ ' + str.tostring(sig_e, format.mintick) + '\nSL ' + str.tostring(sig_sl, format.mintick) + ' · TP ' + str.tostring(sig_tp, format.mintick) + sig_age + sig_res_txt
+    table.cell(info_table, 0, 17, '📌 Señal patrón', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 17, sig_txt, text_color=na(sig_e) ? color.gray : sig_res == '✅ TP' ? #00E676 : sig_res == '❌ SL' ? #FF5252 : (sig_dir == 'LONG ↑' ? #4CAF50 : #F44336), text_size=size.small)
+    // 18: Estado de retroceso Fib
+    fib_txt = not show_fib ? 'OFF' : in_zone_long ? '⚠️ Zona LONG · ' + str.tostring(ret_up, '#.##') : in_zone_short ? '⚠️ Zona SHORT · ' + str.tostring(ret_dn, '#.##') : '🟢 Fuera de zona'
+    table.cell(info_table, 0, 18, '🌊 Retroceso', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 18, fib_txt, text_color=(in_zone_long or in_zone_short) ? #FF9800 : #00E676, text_size=size.small)
+    // 19: FVG activos
+    fvg_txt = not show_fvg ? 'OFF' : str.tostring(array.size(fvgU_top)) + '↑ · ' + str.tostring(array.size(fvgD_top)) + '↓'
+    table.cell(info_table, 0, 19, '🕳️ FVG activos', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 19, fvg_txt, text_color=color.white, text_size=size.small)
 
 // ============================================
 // ALERTAS
 // ============================================
-
-alertcondition(buy_conservative, "🟢 COMPRA PREMIUM", "Chilaquil PRO: Señal COMPRA Premium (RSI <= 30)")
-alertcondition(sell_conservative, "🔴 VENTA PREMIUM", "Chilaquil PRO: Señal VENTA PREMIUM (RSI >= 70)")
+alertcondition(buy_signal, '🟢 COMPRA', 'Chilaquil PRO: señal de COMPRA (modo operación)')
+alertcondition(sell_signal, '🔴 VENTA', 'Chilaquil PRO: señal de VENTA (modo operación)')
+alertcondition(buy_conservative and confirmed, '💠 COMPRA PREMIUM', 'Chilaquil PRO: señal PREMIUM de COMPRA (RSI<=30) — rara, alta convicción')
+alertcondition(sell_conservative and confirmed, '🛑 VENTA PREMIUM', 'Chilaquil PRO: señal PREMIUM de VENTA (RSI>=70) — rara, alta convicción')
+alertcondition(l_sqz, '⚡ Cluster LONGS barrido', 'El precio barrió un cluster de liquidaciones de longs (posible suelo local)')
+alertcondition(s_sqz, '⚡ Cluster SHORTS barrido', 'El precio barrió un cluster de liquidaciones de shorts (posible techo local)')
+alertcondition(pat_2b_long, '📐 PATRÓN: Doble Suelo (LONG)', 'Chilaquil PRO: doble suelo + ruptura → señal LONG por patrón')
+alertcondition(pat_hsi_long, '📐 PATRÓN: HCH Invertida (LONG)', 'Chilaquil PRO: HCH invertida + ruptura → señal LONG por patrón')
+alertcondition(pat_2t_short, '📐 PATRÓN: Doble Techo (SHORT)', 'Chilaquil PRO: doble techo + ruptura → señal SHORT por patrón')
+alertcondition(pat_hch_short, '📐 PATRÓN: HCH (SHORT)', 'Chilaquil PRO: HCH + ruptura → señal SHORT por patrón')
+alertcondition(wyck_spring_long, '🌀 WYCKOFF: Spring → LONG', 'Chilaquil PRO: ruptura falsa de soporte + recuperación (Spring) → LONG')
+alertcondition(wyck_test_long, '🌀 WYCKOFF: Test de Spring → LONG', 'Chilaquil PRO: el precio volvió al nivel del Spring y aguantó → segunda oportunidad LONG')
+alertcondition(wyck_upthrust_short, '🌀 WYCKOFF: Upthrust → SHORT', 'Chilaquil PRO: ruptura falsa de resistencia + caída de vuelta (Upthrust) → SHORT')
+alertcondition(wyck_test_short, '🌀 WYCKOFF: Test de Upthrust → SHORT', 'Chilaquil PRO: el precio volvió al nivel del Upthrust y falló → segunda oportunidad SHORT')
+alertcondition(fib_long, '🌊 RETROCESO: → LONG', 'Chilaquil PRO: entrada anticipada — retroceso en zona 0.50-0.65 de pierna alcista + reacción')
+alertcondition(fib_short, '🌊 RETROCESO: → SHORT', 'Chilaquil PRO: entrada anticipada — retroceso en zona 0.50-0.65 de pierna bajista + reacción')
+alertcondition(fvg_long, '🕳️ FVG: → LONG', 'Chilaquil PRO: retorno a Fair Value Gap alcista + reacción → LONG')
+alertcondition(fvg_short, '🕳️ FVG: → SHORT', 'Chilaquil PRO: retorno a Fair Value Gap bajista + reacción → SHORT')
