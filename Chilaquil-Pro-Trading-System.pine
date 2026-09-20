@@ -1,7 +1,7 @@
 
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// CHILAQUIL PRO SUITE — V7.8.2 (resultado TP/SL en señal de patrón)
+// CHILAQUIL PRO SUITE — V8.1 (auditoría #3: veto sin datos, clamp, neckline, planes abiertos, W/L real)
 // ─────────────────────────────────────────────────────────────────────────────
 // MÓDULO 1 · Señales: tendencia (EMA auto por TF) + MACD + SQZMOM + RSI
 //          + filtros Breakout/Pivots corregidos + confirmación anti-repintado
@@ -22,7 +22,8 @@
 // propia instancia. Cualquier refactor a funciones debe respetar esto.
 //
 // f_norm(src) -> float : src re-escalado a σ100(SQZMOM), clamp ±(3.5σ).
-//   Factor positivo: conserva forma, ceros y cruces.
+//   Conserva ceros y forma. La familia MACD usa f_norm_m (factor ÚNICO σ(macd))
+//   para conservar TAMBIÉN sus cruces internos y el histograma.
 // base_long  = EMAs alineadas ∧ MACD>signal ∧ SQZMOM rising ∧ RSI∈[40,65] ∧
 //   close>highest(high,20)[1] ∧ ¬(pivote persistido a <2 ATR de distancia).
 // base_short = espejo exacto (RSI∈[35,60]).
@@ -33,13 +34,19 @@
 //   sort() ordena prices para búsqueda de vecinos; update_color() aplica
 //   gamma, transparencia y altura dinámica (intensidad relativa al máximo).
 // M4 patrones : ARMED = 3 pivotes con |hombros|≤1.5 ATR, cabeza ≥1 ATR,
-//   simetría ≤2.5×. TRIGGER = cierre a través del valle del hombro derecho.
+//   simetría ≤2.5×. TRIGGER = cierre a través de la neckline CONGELADA
+//   (mínimo/máximo desde la cabeza al armar — jamás un nivel corredizo).
 // M5 wyckoff  : spring/upthrust = falsa ruptura de lowest/highest[1] del rango
 //   con recuperación de cierre y contexto previo; test = retorno ±0.5 ATR.
 // M6 retroceso: pierna = pivotes ≥3 ATR; entrada = reacción en zona 0.50-0.65;
 //   1 señal por pierna (done_leg). Filtro EMA lenta opcional.
-// M7 FVG      : gap de 3 velas con vela central >1 ATR; arrays activos;
-//   señal = retorno al gap + reacción; expira si el cierre lo mitiga.
+// M7 FVG      : bullish high[2]<low / bearish low[2]>high, vela central >1 ATR y
+//   ancho >= 0.1 ATR; zona dibujada como caja hasta mitigarse O CADUCAR
+//   (> fvg_exp barras sin relleno); señal = retorno + reacción tras la vela
+//   de nacimiento; SL más allá del borde del gap, capado por riesgo máximo.
+// SL patrón   = estructura CAPADA por el riesgo máximo del usuario:
+//   long: max(extremo_patron, close - stop_distance) · short: espejo con min.
+// struct_ok   = TF >= mínima elegida (patrones/Wyckoff/retrocesos/FVG).
 // posición    : entradas solo estando flat en ese lado; salidas = SL/TP
 //   fijados en entrada ∨ cambio de tendencia ∨ MACD contrario ∨ RSI 72/28.
 // ───────────────────────────────────────────────────────────────────────────
@@ -95,10 +102,12 @@ enable_adx_filter = input.bool(false, 'Filtrar por fuerza de tendencia (ADX)', g
 adx_len = input.int(14, 'ADX Length', group='FILTROS EXTRA ✚')
 adx_min = input.float(20, 'ADX mínimo', group='FILTROS EXTRA ✚', minval=10, maxval=50, step=1)
 enable_liq_veto = input.bool(true, '🛡️ Vetar entradas contra clusters de liquidación', group='FILTROS EXTRA ✚', tooltip='Bloquea LONG si hay un cluster de liquidaciones de longs más cerca que (multiplicador × tu stop) — y espejo para SHORT. El precio suele ir a barrer esa liquidez antes de despegar: mejor no tener el stop ahí.')
-liq_veto_mult = input.float(1.5, 'Distancia veto (× stop)', group='FILTROS EXTRA ✚', minval=0.5, maxval=5.0, step=0.1)
+liq_veto_mult = input.float(1.0, 'Distancia veto (× stop)', group='FILTROS EXTRA ✚', minval=0.5, maxval=5.0, step=0.1)
+liq_veto_str = input.float(25.0, 'Fuerza mínima del cluster (%)', group='FILTROS EXTRA ✚', minval=5.0, maxval=100.0, step=5.0, tooltip='El veto solo bloquea si el cluster dentro de la ventana acumula al menos este % de la liquidez máxima. Evita vetar por niveles insignificantes.')
 show_patterns = input.bool(true, 'Detectar patrones de chart', group='PATRONES 📐', tooltip='Señales independientes de los indicadores: formación + ruptura. No repintan (pivotes confirmados + cierre de vela).')
 pat_pivot_manual = input.int(5, 'Pivot barras (izq/der) — manual', group='PATRONES 📐', minval=2, maxval=15)
 pat_sep_manual = input.int(80, 'Separación máxima — manual', group='PATRONES 📐', minval=10, maxval=300)
+struct_min_tf = input.string('4H', 'TF mínima: patrones/Wyckoff/retrocesos/FVG', options=['15m', '1H', '4H', 'Todas'], group='PATRONES 📐', tooltip='En temporalidades bajas estas señales estructurales tienen SL de cebo y mucho ruido. "4H" = solo swing puro. Las señales de indicadores (núcleo) SIEMPRE activas.')
 auto_pat_cfg = input.bool(true, '🔧 Auto-ajuste por temporalidad (patrones + Wyckoff + retrocesos)', group='PATRONES 📐', tooltip='ON: pivot, separación, rango Wyckoff, enfriamiento y validez de pierna se ajustan SOLOS según el TF: sensible en intradía, amplio en temporalidades altas. OFF: usa los valores manuales.')
 pat_sh_tol = input.float(1.5, 'Tolerancia hombros/máximos (ATR)', group='PATRONES 📐', minval=0.3, maxval=5.0, step=0.1)
 pat_head_min = input.float(1.0, 'Prominencia mínima cabeza (ATR)', group='PATRONES 📐', minval=0.3, maxval=5.0, step=0.1)
@@ -108,6 +117,7 @@ wyck_len_manual = input.int(60, 'Rango (barras) — manual', group='WYCKOFF 🌀
 wyck_cool_manual = input.int(20, 'Enfriamiento — manual', group='WYCKOFF 🌀', minval=5, maxval=100)
 wyck_vol = input.bool(false, 'Exigir volumen climático', group='WYCKOFF 🌀', tooltip='ON: solo Spring/Upthrust con volumen > 1.3× su media (clímax). OFF: acepta también los de bajo volumen (sin oferta/demanda).')
 wyck_vol_mult = input.float(1.3, 'Mult. volumen climático', group='WYCKOFF 🌀', minval=1.0, maxval=3.0, step=0.1)
+wyck_test_max = input.int(60, 'Caducidad del Test (barras)', group='WYCKOFF 🌀', minval=10, maxval=300, tooltip='Pasado este tiempo desde el Spring/Upthrust, su nivel deja de ser válido para un Test.')
 show_fib = input.bool(true, 'Entradas en retroceso (núcleo de Elliott)', group='RETROCESOS 🌊', tooltip='La parte OPERATIVA de Elliott sin la subjetividad del conteo: pierna de impulso confirmada + entrada en la zona de retroceso 0.50-0.65 cuando aparece reacción. ANTIOPA la entrada: no espera la ruptura del patrón.')
 fib_zone_a = input.float(0.50, 'Inicio zona retroceso', group='RETROCESOS 🌊', minval=0.2, maxval=0.9, step=0.01)
 fib_zone_b = input.float(0.65, 'Fin zona retroceso', group='RETROCESOS 🌊', minval=0.3, maxval=0.95, step=0.01)
@@ -116,7 +126,9 @@ fib_age_manual = input.int(60, 'Validez de la pierna — manual', group='RETROCE
 fib_trend = input.bool(true, 'Solo a favor de la EMA lenta', group='RETROCESOS 🌊', tooltip='LONG solo sobre la EMA lenta, SHORT solo bajo ella.')
 show_fvg = input.bool(true, 'Detectar Fair Value Gaps (FVG)', group='FVG 🕳️', tooltip='Desequilibrio de 3 velas (mecánico, estilo ICT): el precio suele volver a rellenar el gap antes de continuar. Señal = retorno al gap + vela de reacción a favor.')
 fvg_disp_mult = input.float(1.0, 'Desplazamiento mínimo vela central (ATR)', group='FVG 🕳️', minval=0.3, maxval=5.0, step=0.1, tooltip='El FVG debe nacer de un impulso real: la vela del medio mayor que este múltiplo del ATR.')
-fvg_max = input.int(20, 'Máx. FVG activos por lado', group='FVG 🕳️', minval=5, maxval=50)
+fvg_max = input.int(8, 'Máx. FVG activos por lado', group='FVG 🕳️', minval=2, maxval=30, tooltip='Pocos gaps grandes y recientes > muchos gaps viejos tapando las velas. Con 8 por lado el gráfico se mantiene legible. Los más antiguos se descartan automáticamente al superar el límite.')
+fvg_min_w = input.float(0.10, 'Ancho mínimo del gap (ATR)', group='FVG 🕳️', minval=0.0, maxval=1.0, step=0.05, tooltip='Los FVG microscópicos son ruido en temporalidades bajas y provocan stops por centavos. Solo se aceptan gaps de al menos este ancho relativo al ATR. En 30m considera 0.20-0.30.')
+fvg_exp = input.int(0, 'Caducidad del FVG (barras)', group='FVG 🕳️', minval=0, maxval=2000, tooltip='0 = AUTOMÁTICO por temporalidad (recomendado): el gap caduca según el horizonte operativo de cada TF, así un FVG viejo de años (ej. 11K en semanal) desaparece solo. Valor > 0 = caducidad manual en barras. Un gap que el precio no rellena a tiempo ya no es liquidez pendiente.')
 
 breakout_lookback = input.int(20, 'Lookback Breakout', group='Mejoras')
 pivot_lookback = input.int(5, 'Lookback Pivots', group='Mejoras')
@@ -198,7 +210,12 @@ lev2 = auto_liq_cfg ? auto_l2 : lev2_manual
 lev3 = auto_liq_cfg ? auto_l3 : lev3_manual
 ltf = auto_liq_cfg ? (tf_in_seconds < 240 ? '1' : tf_in_seconds < 3600 ? '5' : tf_in_seconds < 86400 ? '15' : tf_in_seconds < 604800 ? '60' : '240') : ltf_manual
 // AUTO-CONFIG: ancho de nivel ≈ 0.05% del precio (mismo detalle en BTC, ETH o ZEC)
-scale_ticks = auto_liq_cfg ? math.max(20, math.round(close * (liq_scale_pct / 100) / syminfo.mintick)) : scale_ticks_manual
+// Cuantizada a potencias de 2: la malla de buckets solo cambia cuando el precio
+// se multiplica por ~1.4 (no en cada $200 de movimiento). Si la malla derivara,
+// price == prices solo fusionaría dentro de la misma vela.
+_raw_ticks = math.max(20, math.round(close * (liq_scale_pct / 100) / syminfo.mintick))
+_pow2 = math.round(math.log(_raw_ticks) / math.log(2))
+scale_ticks = auto_liq_cfg ? math.round(math.pow(2, _pow2)) : scale_ticks_manual
 scale = syminfo.mintick * scale_ticks
 
 // AUTO-AJUSTE DE PATRONES / WYCKOFF / RETROCESOS POR TEMPORALIDAD
@@ -230,6 +247,13 @@ wyck_len = auto_pat_cfg ? auto_wyck_len : wyck_len_manual
 wyck_cool = auto_pat_cfg ? auto_wyck_cool : wyck_cool_manual
 fib_age_auto = tf_in_seconds < 3600 ? 30 : tf_in_seconds < 14400 ? 45 : tf_in_seconds < 86400 ? 60 : tf_in_seconds < 604800 ? 120 : 250
 fib_age = auto_pat_cfg ? fib_age_auto : fib_age_manual
+// Puerta de temporalidad mínima para los módulos estructurales
+struct_min_sec = struct_min_tf == '15m' ? 900 : struct_min_tf == '1H' ? 3600 : struct_min_tf == '4H' ? 14400 : 0
+struct_ok = tf_in_seconds >= struct_min_sec
+// Caducidad AUTO escalada por TF: cada temporalidad solo conserva gaps que el
+// precio podría rellenar dentro de su propio horizonte operativo.
+fvg_exp_auto = tf_in_seconds < 14400 ? 400 : tf_in_seconds < 86400 ? 250 : tf_in_seconds < 604800 ? 100 : 60
+fvg_exp_use = fvg_exp == 0 ? fvg_exp_auto : fvg_exp
 
 // ============================================
 // PERSISTENCIA DEL ESTADO DE LAS POSICIONES
@@ -314,6 +338,12 @@ near_support = enable_pivot_filter and not na(last_pl) and close > last_pl and (
 res_dist_atr = not na(last_ph) and close < last_ph and atr > 0 ? (last_ph - close) / atr : na
 sup_dist_atr = not na(last_pl) and close > last_pl and atr > 0 ? (close - last_pl) / atr : na
 
+// Extremos de RSI de los últimos 5 barras: el motor de Premium exige
+// sobreventa/sobrecompra reciente (no necesariamente en la vela actual) con el
+// momentum YA girado a favor. Precomputado en scope global para Pine v6.
+rsi_low5 = ta.lowest(rsi, 5)
+rsi_high5 = ta.highest(rsi, 5)
+
 rsi_ok_long = rsi >= rsi_min_long and rsi <= rsi_max_long
 rsi_ok_short = rsi <= rsi_max_short and rsi >= rsi_min_short
 
@@ -349,6 +379,22 @@ var bool db_armed = false
 var float db_ref = na
 var float db_bot = na
 
+// Precomputado en scope GLOBAL: Pine exige que ta.* se ejecute en TODAS las
+// velas (dentro de un if es error en v6). Se recalcula cada vela con la
+// ventana desde la cabeza/mínimo relevante.
+// Neckline = valle/techo ENTRE la cabeza y la confirmación del hombro, calculada
+// al armar (tras el corrimiento de pivotes, ph_bb/pl_bb YA es la cabeza).
+f_neck_dn(int head_bar) =>
+    float neck = low[pat_pivot]
+    for k = pat_pivot to math.min(bar_index - head_bar, 499)
+        neck := math.min(neck, low[k])
+    neck
+f_neck_up(int head_bar) =>
+    float peak = high[pat_pivot]
+    for k = pat_pivot to math.min(bar_index - head_bar, 499)
+        peak := math.max(peak, high[k])
+    peak
+
 if not na(pat_ph)
     ph_a := ph_b
     ph_ab := ph_bb
@@ -365,24 +411,24 @@ if not na(pat_ph)
         // HCH: hombros a altura similar + cabeza prominente + simetría
         if math.abs(ph_a - ph_c) <= atr * pat_sh_tol and ph_b - math.max(ph_a, ph_c) >= atr * pat_head_min and sym_ok
             hch_armed := true
-            hch_ref := low
+            // Neckline CONGELADA: mínimo desde el pivote de la cabeza (trough cabeza→hombro der).
+            // NUNCA un mínimo corredizo: perseguiría al precio y el trigger sería imposible.
+            hch_ref := f_neck_dn(ph_bb)
         // Doble techo: dos máximos similares separados
         dt_sep = ph_cb - ph_bb
         if math.abs(ph_b - ph_c) <= atr * pat_sh_tol and dt_sep >= pat_pivot and dt_sep <= pat_sep_max
             dt_armed := true
-            dt_ref := low
+            dt_ref := f_neck_dn(ph_bb)
             dt_top := math.max(ph_b, ph_c)
 
 if hch_armed
     if bar_index - ph_cb > pat_sep_max or close > ph_b
         hch_armed := false
-    else
-        hch_ref := math.min(hch_ref, low)
+
 if dt_armed
     if bar_index - ph_cb > pat_sep_max or close > dt_top
         dt_armed := false
-    else
-        dt_ref := math.min(dt_ref, low)
+
 
 pat_hch_short_raw = hch_armed and close < hch_ref
 pat_2t_short_raw = dt_armed and close < dt_ref
@@ -403,24 +449,22 @@ if not na(pat_pl)
         // HCH invertida: hombros similares + cabeza hundida prominente
         if math.abs(pl_a - pl_c) <= atr * pat_sh_tol and math.min(pl_a, pl_c) - pl_b >= atr * pat_head_min and sym_okl
             hsi_armed := true
-            hsi_ref := high
+            hsi_ref := f_neck_up(pl_bb)
         // Doble suelo: dos mínimos similares separados
         db_sep = pl_cb - pl_bb
         if math.abs(pl_b - pl_c) <= atr * pat_sh_tol and db_sep >= pat_pivot and db_sep <= pat_sep_max
             db_armed := true
-            db_ref := high
+            db_ref := f_neck_up(pl_bb)
             db_bot := math.min(pl_b, pl_c)
 
 if hsi_armed
     if bar_index - pl_cb > pat_sep_max or close < pl_b
         hsi_armed := false
-    else
-        hsi_ref := math.max(hsi_ref, high)
+
 if db_armed
     if bar_index - pl_cb > pat_sep_max or close < db_bot
         db_armed := false
-    else
-        db_ref := math.max(db_ref, high)
+
 
 pat_hsi_long_raw = hsi_armed and close > hsi_ref
 pat_2b_long_raw = db_armed and close > db_ref
@@ -457,12 +501,17 @@ var float spring_low = na
 var float upthrust_high = na
 if spring_sig
     spring_low := low
-test_spring_raw = not na(spring_low) and bar_index - last_spring > 3 and low <= spring_low + atr * 0.5 and close > open and close > spring_low
+// Invalidación: si el cierre pierde el nivel del Spring, ya no es válido
+if not na(spring_low) and close < spring_low
+    spring_low := na
+test_spring_raw = not na(spring_low) and bar_index - last_spring > 3 and bar_index - last_spring <= wyck_test_max and low <= spring_low + atr * 0.5 and close > open and close > spring_low
 if test_spring_raw
     spring_low := na
 if upthrust_sig
     upthrust_high := high
-test_upthrust_raw = not na(upthrust_high) and bar_index - last_upthrust > 3 and high >= upthrust_high - atr * 0.5 and close < open and close < upthrust_high
+if not na(upthrust_high) and close > upthrust_high
+    upthrust_high := na
+test_upthrust_raw = not na(upthrust_high) and bar_index - last_upthrust > 3 and bar_index - last_upthrust <= wyck_test_max and high >= upthrust_high - atr * 0.5 and close < open and close < upthrust_high
 if test_upthrust_raw
     upthrust_high := na
 
@@ -520,12 +569,14 @@ if fib_short_raw
 
 // ═══════════════════════════════════════════════════════════
 // MÓDULO 7 · FAIR VALUE GAPS (FVG) — desequilibrios de 3 velas
-// Bullish: low[2] > high → gap [high, low[2]] creado por desplazamiento.
-// Bearish: high[2] < low → gap [high[2], low].
-// Señal: el precio VUELVE al gap y reacciona a favor (relleno parcial).
+// Bullish: high[2] < low → gap [high[2], low] creado por desplazamiento alcista.
+// Bearish: low[2] > high → gap [high, low[2]].
+// Filtros: ancho >= 0.1 ATR · caducan si no se rellenan (auto por TF).
+// Señal: el precio VUELVE al gap (tras la vela de nacimiento) y reacciona a favor.
 // ═══════════════════════════════════════════════════════════
-fvg_up_new = low[2] > high and (high[1] - low[1]) > atr * fvg_disp_mult
-fvg_dn_new = high[2] < low and (high[1] - low[1]) > atr * fvg_disp_mult
+// Bullish: high[2] < low (gap ALCISTA entre vela 1 y 3). Bearish: low[2] > high.
+fvg_up_new = high[2] < low and (high[1] - low[1]) > atr * fvg_disp_mult and (low - high[2]) >= atr * fvg_min_w
+fvg_dn_new = low[2] > high and (high[1] - low[1]) > atr * fvg_disp_mult and (low[2] - high) >= atr * fvg_min_w
 
 var array<float> fvgU_top = array.new<float>()
 var array<float> fvgU_bot = array.new<float>()
@@ -533,43 +584,75 @@ var array<int> fvgU_bar = array.new<int>()
 var array<float> fvgD_top = array.new<float>()
 var array<float> fvgD_bot = array.new<float>()
 var array<int> fvgD_bar = array.new<int>()
+var array<box> fvgU_box = array.new<box>()
+var array<box> fvgD_box = array.new<box>()
+var float fvg_sig_bot = na
+var float fvg_sig_top = na
 
-if show_fvg
+if show_fvg and struct_ok
     if fvg_up_new
         if array.size(fvgU_top) >= fvg_max
-            array.shift(fvgU_top), array.shift(fvgU_bot), array.shift(fvgU_bar)
-        array.push(fvgU_top, low[2]), array.push(fvgU_bot, high), array.push(fvgU_bar, bar_index)
+            array.shift(fvgU_top), array.shift(fvgU_bot), array.shift(fvgU_bar), array.get(fvgU_box, 0).delete(), array.shift(fvgU_box)
+        // La ZONA del gap se dibuja como caja: se ve su tamaño REAL (si es un
+        // hilo delgado, es ruido — el filtro de ancho ya los descartó, pero la
+        // visualización te deja juzgar la calidad de los que quedan).
+        array.push(fvgU_top, low), array.push(fvgU_bot, high[2]), array.push(fvgU_bar, bar_index)
+        array.push(fvgU_box, box.new(bar_index - 2, low, bar_index, high[2], color.new(#00C853, 20), 1, bgcolor=color.new(#00C853, 82), force_overlay=true))
     if fvg_dn_new
         if array.size(fvgD_top) >= fvg_max
-            array.shift(fvgD_top), array.shift(fvgD_bot), array.shift(fvgD_bar)
-        array.push(fvgD_top, low), array.push(fvgD_bot, high[2]), array.push(fvgD_bar, bar_index)
+            array.shift(fvgD_top), array.shift(fvgD_bot), array.shift(fvgD_bar), array.get(fvgD_box, 0).delete(), array.shift(fvgD_box)
+        array.push(fvgD_top, low[2]), array.push(fvgD_bot, high), array.push(fvgD_bar, bar_index)
+        array.push(fvgD_box, box.new(bar_index - 2, low[2], bar_index, high, color.new(#FF1744, 20), 1, bgcolor=color.new(#FF1744, 82), force_overlay=true))
 
 bool fvg_long_raw = false
 bool fvg_short_raw = false
 var int last_fvg_long = -100000
 var int last_fvg_short = -100000
-if show_fvg and bar_index - last_fvg_long > 5 and array.size(fvgU_top) > 0
+if show_fvg and struct_ok and array.size(fvgU_top) > 0
     for i = array.size(fvgU_top) - 1 to 0
         float t = array.get(fvgU_top, i)
         float b = array.get(fvgU_bot, i)
-        if close < b
-            // Gap mitigado por completo → se descarta
-            array.remove(fvgU_top, i), array.remove(fvgU_bot, i), array.remove(fvgU_bar, i)
-        else if low <= t and bull_react and trend_ok_long
-            // Retorno al gap + reacción alcista → señal
+        bool aged = bar_index > array.get(fvgU_bar, i)
+        box bx = array.get(fvgU_box, i)
+        if aged and (bar_index - array.get(fvgU_bar, i) > fvg_exp_use)
+            // CADUCADO: el precio no volvió en fvg_exp barras → liquidez que ya
+            // no existe. Se descarta y su caja desaparece del gráfico.
+            bx.delete()
+            array.remove(fvgU_top, i), array.remove(fvgU_bot, i), array.remove(fvgU_bar, i), array.remove(fvgU_box, i)
+        else if aged and close < b
+            // Gap mitigado por completo → se descarta (y su caja)
+            bx.delete()
+            array.remove(fvgU_top, i), array.remove(fvgU_bot, i), array.remove(fvgU_bar, i), array.remove(fvgU_box, i)
+        else if aged and bar_index - last_fvg_long > 5 and low <= t and bull_react and trend_ok_long
+            // Retorno al gap + reacción alcista → señal (se captura el fondo
+            // del gap para el SL estructural, y se consume la zona)
             fvg_long_raw := true
             last_fvg_long := bar_index
-            array.remove(fvgU_top, i), array.remove(fvgU_bot, i), array.remove(fvgU_bar, i)
-if show_fvg and bar_index - last_fvg_short > 5 and array.size(fvgD_top) > 0
+            fvg_sig_bot := b
+            bx.delete()
+            array.remove(fvgU_top, i), array.remove(fvgU_bot, i), array.remove(fvgU_bar, i), array.remove(fvgU_box, i)
+        else
+            bx.set_right(bar_index)
+if show_fvg and struct_ok and array.size(fvgD_top) > 0
     for i = array.size(fvgD_top) - 1 to 0
         float t2 = array.get(fvgD_top, i)
         float b2 = array.get(fvgD_bot, i)
-        if close > t2
-            array.remove(fvgD_top, i), array.remove(fvgD_bot, i), array.remove(fvgD_bar, i)
-        else if high >= b2 and bear_react and trend_ok_short
+        bool aged2 = bar_index > array.get(fvgD_bar, i)
+        box bx2 = array.get(fvgD_box, i)
+        if aged2 and (bar_index - array.get(fvgD_bar, i) > fvg_exp_use)
+            bx2.delete()
+            array.remove(fvgD_top, i), array.remove(fvgD_bot, i), array.remove(fvgD_bar, i), array.remove(fvgD_box, i)
+        else if aged2 and close > t2
+            bx2.delete()
+            array.remove(fvgD_top, i), array.remove(fvgD_bot, i), array.remove(fvgD_bar, i), array.remove(fvgD_box, i)
+        else if aged2 and bar_index - last_fvg_short > 5 and high >= b2 and bear_react and trend_ok_short
             fvg_short_raw := true
             last_fvg_short := bar_index
-            array.remove(fvgD_top, i), array.remove(fvgD_bot, i), array.remove(fvgD_bar, i)
+            fvg_sig_top := t2
+            bx2.delete()
+            array.remove(fvgD_top, i), array.remove(fvgD_bot, i), array.remove(fvgD_bar, i), array.remove(fvgD_box, i)
+        else
+            bx2.set_right(bar_index)
 
 
 
@@ -601,11 +684,9 @@ start_time := start_mode == 'Manual' ? start_time : start_mode == 'Todo el histo
 if barstate.isfirst and time > start_time
     start_time := time
 
-var int start_idx = 0
-if start_time > 0
-    if time[1] < start_time and time >= start_time
-        start_idx := bar_index
-start_time_cond = start_time <= 0 or (start_idx > 0 and bar_index > start_idx)
+// Condición simple y robusta: si todo el historial cargado es posterior a la
+// fecha de inicio (típico en 1m/5m con ventana corta), simplemente todo cuenta.
+start_time_cond = start_time <= 0 or time >= start_time
 
 [oid, oid_high, oid_low] = request.security('BINANCE:' + syminfo.basecurrency + 'USDT.P_OI', timeframe.period, [close - close[1], high - close[1], low - close[1]], ignore_invalid_symbol=true)
 oid_abs = math.max(math.abs(oid_high), math.abs(oid_low))
@@ -641,7 +722,9 @@ method add(liquidation l, box lvl, float contracts, float price) =>
         for i = 0 to l.liq.size() - 1
             _lvl = l.liq.get(i).lvl
             _contracts = l.liq.get(i).contracts
-            if lvl.get_top() == _lvl.get_top()
+            // Comparar contra el PRECIO del bucket (prices no se muta), no contra
+            // get_top(): update_color() mueve tops/bottoms y rompería la fusión.
+            if price == l.prices.get(i)
                 lvl.delete()
                 overlap := true
                 _lvl.set_right(bar_index)
@@ -673,6 +756,7 @@ method sqz(liquidation l) =>
                         l.liq.get(i).lvl.set_right(bar_index + 1)
                     if condition
                         sqz := true
+                        l.liq.get(i).lvl.delete()
                         l.liq.remove(i)
                         l.prices.remove(i)
                 if not proceed
@@ -711,7 +795,8 @@ method update_color(liq_lvl[] liq) =>
             float intensity = mg > 0 ? cn / mg : 0
             c = color.from_gradient(cn, 0, mg, liq_btm_color, liq_top_color)
             box b = liq.get(i).lvl
-            b.set_bgcolor(c)
+            // Aplicar la transparencia configurada (antes se pisaba con el color opaco)
+            b.set_bgcolor(color.new(c, liq_transp))
             b.set_border_color(c)
             // Altura dinámica: los clusters intensos se dibujan GRUESOS
             // (estilo Coinglass). Se recentra sobre el precio del nivel.
@@ -743,8 +828,8 @@ method get_liquidation_levels(liquidation longs, liquidation shorts, int lev1, i
             // puede dispararse (una vela mensual = ~8.000 barras de 5m). Procesar
             // como máximo las 600 más recientes evita el RE10022 sin perder
             // información relevante del lado actual del mercado.
-            int max_ib = math.min(intrabar.size(), 600)
-            for i = 0 to max_ib - 1
+            int ib_from = math.max(0, intrabar.size() - 600)
+            for i = ib_from to intrabar.size() - 1
                 _open = intrabar.get(i).o
                 _high = intrabar.get(i).h
                 _close = intrabar.get(i).c
@@ -870,8 +955,30 @@ adx_ok = not enable_adx_filter or adx_val >= adx_min
 // VETO POR LIQUIDEZ: no entrar si tu stop quedaría DENTRO de un cluster de
 // liquidaciones del lado contrario — el precio irá a barrerlo antes de despegar.
 veto_stop_dist = risk_method == 'ATR' ? atr * atr_multiplier : close * (stop_loss_percent / 100)
-liq_veto_long = enable_liq_veto and show_heatmap and not na(near_long_liq) and (close - near_long_liq) < veto_stop_dist * liq_veto_mult
-liq_veto_short = enable_liq_veto and show_heatmap and not na(near_short_liq) and (near_short_liq - close) < veto_stop_dist * liq_veto_mult
+// Veto ponderado: solo vetar si hay un cluster SIGNIFICATIVO (≥ liq_veto_str %
+// de la liquidez máxima) dentro de la ventana del stop. Un nivel diminuto no veta.
+// Veto ponderado: recorre los niveles dentro de la ventana DEL PRECIO (no del
+// nivel más cercano, que puede ser diminuto mientras el fuerte queda lejos).
+f_strong_below(liquidation l, float win) =>
+    float mx = 0
+    if l.prices.size() > 0
+        for i = 0 to l.prices.size() - 1
+            p = l.prices.get(i)
+            if p < close and close - p <= win and l.liq.get(i).contracts > mx
+                mx := l.liq.get(i).contracts
+    // SIN DATOS = SIN VETO (arrays vacíos: 0 >= 0 daría TRUE y bloquearía todo)
+    mx > 0 and mx >= l.liq.max_contracts() * (liq_veto_str / 100)
+f_strong_above(liquidation l, float win) =>
+    float mx = 0
+    if l.prices.size() > 0
+        for i = 0 to l.prices.size() - 1
+            p = l.prices.get(i)
+            if p > close and p - close <= win and l.liq.get(i).contracts > mx
+                mx := l.liq.get(i).contracts
+    // SIN DATOS = SIN VETO (arrays vacíos: 0 >= 0 daría TRUE y bloquearía todo)
+    mx > 0 and mx >= l.liq.max_contracts() * (liq_veto_str / 100)
+liq_veto_long = enable_liq_veto and show_heatmap and f_strong_below(longs, veto_stop_dist * liq_veto_mult)
+liq_veto_short = enable_liq_veto and show_heatmap and f_strong_above(shorts, veto_stop_dist * liq_veto_mult)
 
 // ============================================
 // SISTEMA DE SEÑALES
@@ -883,17 +990,17 @@ macd_bearish = macd < signal_line
 sqz_bullish = val_sqz > 0 and val_sqz > nz(val_sqz[1])
 sqz_bearish = val_sqz < 0 and val_sqz < nz(val_sqz[1])
 
-buy_conservative = bullish_trend and macd_bullish and sqz_bullish and rsi <= 30 and breakout_long and not near_resistance
-sell_conservative = bearish_trend and macd_bearish and sqz_bearish and rsi >= 70 and breakdown_short and not near_support
+buy_conservative = ema_fast_line > ema_slow_line and macd_bullish and sqz_bullish and rsi_low5 <= 30 and not near_resistance
+sell_conservative = ema_fast_line < ema_slow_line and macd_bearish and sqz_bearish and rsi_high5 >= 70 and not near_support
 buy_balanced = bullish_trend and macd_bullish and sqz_bullish and rsi_ok_long and breakout_long and not near_resistance
 sell_balanced = bearish_trend and macd_bearish and sqz_bearish and rsi_ok_short and breakdown_short and not near_support
 
 confirmed = wait_close ? barstate.isconfirmed : true
 // Patrones: gatillo + confirmación de cierre (anti-repintado). Se desarman al disparar.
-pat_hch_short = pat_hch_short_raw and confirmed
-pat_2t_short = pat_2t_short_raw and confirmed
-pat_hsi_long = pat_hsi_long_raw and confirmed
-pat_2b_long = pat_2b_long_raw and confirmed
+pat_hch_short = show_patterns and pat_hch_short_raw and confirmed and struct_ok
+pat_2t_short = show_patterns and pat_2t_short_raw and confirmed and struct_ok
+pat_hsi_long = show_patterns and pat_hsi_long_raw and confirmed and struct_ok
+pat_2b_long = show_patterns and pat_2b_long_raw and confirmed and struct_ok
 if pat_hch_short
     hch_armed := false
 if pat_2t_short
@@ -902,107 +1009,121 @@ if pat_hsi_long
     hsi_armed := false
 if pat_2b_long
     db_armed := false
-wyck_spring_long = show_wyckoff and spring_sig and confirmed
-wyck_test_long = show_wyckoff and test_spring_raw and confirmed
-wyck_upthrust_short = show_wyckoff and upthrust_sig and confirmed
-wyck_test_short = show_wyckoff and test_upthrust_raw and confirmed
-// ── Plan de trade de la última señal de patrón/Wyckoff ──
+wyck_spring_long = show_wyckoff and spring_sig and confirmed and struct_ok
+wyck_test_long = show_wyckoff and test_spring_raw and confirmed and struct_ok
+wyck_upthrust_short = show_wyckoff and upthrust_sig and confirmed and struct_ok
+wyck_test_short = show_wyckoff and test_upthrust_raw and confirmed and struct_ok
+// ── Plan de trade: SL = estructura CAPADO por tu riesgo máximo ──
+// (nunca más lejos que stop_loss_percent/ATR: un SL del 24% es liquidación)
 // Entrada = cierre de la vela señal. SL = extremo del patrón + 0.5 ATR de
 // colchón. TP = R/R objetivo sobre el riesgo.
+// ── PLANES ABIERTOS (lista): corrige el sesgo del slot único ──
+// Cada señal empuja su plan; TODOS se resuelven cada vela con prioridad SL.
+// El más reciente SIN resolver alimenta la fila 📌 de la tabla.
+var array<string> p_dir = array.new<string>()
+var array<float> p_sl = array.new<float>()
+var array<float> p_tp = array.new<float>()
+var array<string> p_mod = array.new<string>()
+var array<int> p_bar = array.new<int>()
 var float sig_e = na
-var float sig_sl = na
-var float sig_tp = na
 var string sig_name = ''
 var string sig_dir = ''
+var string sig_mod = ''
 var int sig_bar2 = na
+// Solo empuja a los arrays: Pine NO permite mutar globales dentro de funciones.
+// El display (sig_*) se actualiza en scope global tras los pushes (abajo).
+f_push_plan(string d, float sl, float tp, string m) =>
+    if array.size(p_dir) >= 10
+        array.shift(p_dir), array.shift(p_sl), array.shift(p_tp), array.shift(p_mod), array.shift(p_bar)
+    array.push(p_dir, d), array.push(p_sl, sl), array.push(p_tp, tp), array.push(p_mod, m), array.push(p_bar, bar_index)
+// Win/Loss por módulo (la métrica que separa lo útil de lo decorativo)
+var int w_pat = 0
+var int l_pat = 0
+var int w_wyck = 0
+var int l_wyck = 0
+var int w_fib = 0
+var int l_fib = 0
+var int w_fvg = 0
+var int l_fvg = 0
 if pat_2b_long
-    sig_name := 'Doble suelo', sig_dir := 'LONG ↑', sig_e := close
-    sig_sl := db_bot - atr * 0.5
-    sig_tp := close + (close - sig_sl) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('LONG ↑', (math.max(db_bot - atr * 0.5, close - veto_stop_dist)), close + (close - (math.max(db_bot - atr * 0.5, close - veto_stop_dist))) * pat_rr_mult, 'pat')  // Doble suelo
 if pat_hsi_long
-    sig_name := 'HCH invertida', sig_dir := 'LONG ↑', sig_e := close
-    sig_sl := pl_b - atr * 0.5
-    sig_tp := close + (close - sig_sl) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('LONG ↑', (math.max(pl_b - atr * 0.5, close - veto_stop_dist)), close + (close - (math.max(pl_b - atr * 0.5, close - veto_stop_dist))) * pat_rr_mult, 'pat')  // HCH invertida
 if pat_2t_short
-    sig_name := 'Doble techo', sig_dir := 'SHORT ↓', sig_e := close
-    sig_sl := dt_top + atr * 0.5
-    sig_tp := close - (sig_sl - close) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('SHORT ↓', (math.min(dt_top + atr * 0.5, close + veto_stop_dist)), close - ((math.min(dt_top + atr * 0.5, close + veto_stop_dist)) - close) * pat_rr_mult, 'pat')  // Doble techo
 if pat_hch_short
-    sig_name := 'HCH', sig_dir := 'SHORT ↓', sig_e := close
-    sig_sl := ph_b + atr * 0.5
-    sig_tp := close - (sig_sl - close) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('SHORT ↓', (math.min(ph_b + atr * 0.5, close + veto_stop_dist)), close - ((math.min(ph_b + atr * 0.5, close + veto_stop_dist)) - close) * pat_rr_mult, 'pat')  // HCH
 if wyck_spring_long
-    sig_name := 'Spring', sig_dir := 'LONG ↑', sig_e := close
-    sig_sl := spring_low - atr * 0.5
-    sig_tp := close + (close - sig_sl) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('LONG ↑', (math.max(spring_low - atr * 0.5, close - veto_stop_dist)), close + (close - (math.max(spring_low - atr * 0.5, close - veto_stop_dist))) * pat_rr_mult, 'wyck')  // Spring
 if wyck_test_long
-    sig_name := 'Test Spring', sig_dir := 'LONG ↑', sig_e := close
-    sig_sl := low - atr * 0.5
-    sig_tp := close + (close - sig_sl) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('LONG ↑', (math.max(low - atr * 0.5, close - veto_stop_dist)), close + (close - (math.max(low - atr * 0.5, close - veto_stop_dist))) * pat_rr_mult, 'wyck')  // Test Spring
 if wyck_upthrust_short
-    sig_name := 'Upthrust', sig_dir := 'SHORT ↓', sig_e := close
-    sig_sl := upthrust_high + atr * 0.5
-    sig_tp := close - (sig_sl - close) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('SHORT ↓', (math.min(upthrust_high + atr * 0.5, close + veto_stop_dist)), close - ((math.min(upthrust_high + atr * 0.5, close + veto_stop_dist)) - close) * pat_rr_mult, 'wyck')  // Upthrust
 if wyck_test_short
-    sig_name := 'Test Upthrust', sig_dir := 'SHORT ↓', sig_e := close
-    sig_sl := high + atr * 0.5
-    sig_tp := close - (sig_sl - close) * pat_rr_mult
-    sig_bar2 := bar_index
-fib_long = show_fib and fib_long_raw and confirmed
-fib_short = show_fib and fib_short_raw and confirmed
+    f_push_plan('SHORT ↓', (math.min(high + atr * 0.5, close + veto_stop_dist)), close - ((math.min(high + atr * 0.5, close + veto_stop_dist)) - close) * pat_rr_mult, 'wyck')  // Test Upthrust
+fib_long = show_fib and fib_long_raw and confirmed and struct_ok
+fib_short = show_fib and fib_short_raw and confirmed and struct_ok
 if fib_long
-    sig_name := 'Retroceso', sig_dir := 'LONG ↑', sig_e := close
-    sig_sl := low - atr * 0.5
-    sig_tp := close + (close - sig_sl) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('LONG ↑', (math.max(low - atr * 0.5, close - veto_stop_dist)), close + (close - (math.max(low - atr * 0.5, close - veto_stop_dist))) * pat_rr_mult, 'fib')  // Retroceso
 if fib_short
-    sig_name := 'Retroceso', sig_dir := 'SHORT ↓', sig_e := close
-    sig_sl := high + atr * 0.5
-    sig_tp := close - (sig_sl - close) * pat_rr_mult
-    sig_bar2 := bar_index
-fvg_long = show_fvg and fvg_long_raw and confirmed
-fvg_short = show_fvg and fvg_short_raw and confirmed
+    f_push_plan('SHORT ↓', (math.min(high + atr * 0.5, close + veto_stop_dist)), close - ((math.min(high + atr * 0.5, close + veto_stop_dist)) - close) * pat_rr_mult, 'fib')  // Retroceso
+fvg_long = show_fvg and fvg_long_raw and confirmed and struct_ok
+fvg_short = show_fvg and fvg_short_raw and confirmed and struct_ok
 if fvg_long
-    sig_name := 'FVG', sig_dir := 'LONG ↑', sig_e := close
-    sig_sl := low - atr * 0.5
-    sig_tp := close + (close - sig_sl) * pat_rr_mult
-    sig_bar2 := bar_index
+    f_push_plan('LONG ↑', (math.max(na(fvg_sig_bot) ? low - atr * 0.5 : math.min(low, fvg_sig_bot) - atr * 0.5, close - veto_stop_dist)), close + (close - (math.max(na(fvg_sig_bot) ? low - atr * 0.5 : math.min(low, fvg_sig_bot) - atr * 0.5, close - veto_stop_dist))) * pat_rr_mult, 'fvg')  // FVG
 if fvg_short
-    sig_name := 'FVG', sig_dir := 'SHORT ↓', sig_e := close
-    sig_sl := high + atr * 0.5
-    sig_tp := close - (sig_sl - close) * pat_rr_mult
+    f_push_plan('SHORT ↓', (math.min(na(fvg_sig_top) ? high + atr * 0.5 : math.max(high, fvg_sig_top) + atr * 0.5, close + veto_stop_dist)), close - ((math.min(na(fvg_sig_top) ? high + atr * 0.5 : math.max(high, fvg_sig_top) + atr * 0.5, close + veto_stop_dist)) - close) * pat_rr_mult, 'fvg')  // FVG
+
+
+// SL/TP se evalúan desde la vela SIGUIENTE a la señal (la entrada es al cierre).
+// Display de la señal más reciente (scope global: aquí SÍ se permite ':=')
+if array.size(p_bar) > 0 and array.get(p_bar, array.size(p_bar) - 1) == bar_index
+    sig_e := close
+    sig_dir := array.get(p_dir, array.size(p_dir) - 1)
+    sig_mod := array.get(p_mod, array.size(p_mod) - 1)
+    sig_name := sig_mod
     sig_bar2 := bar_index
 
-// ── RESULTADO de la señal de patrón (evita mostrar planes caducados) ──
-var string sig_res = ''
-var int sig_res_bar = na
-// Una señal nueva reinicia el seguimiento
-if sig_bar2 == bar_index
-    sig_res := ''
-    sig_res_bar := na
-// SL/TP se evalúan desde la vela SIGUIENTE a la señal (la entrada es al cierre)
-if sig_res == '' and bar_index > nz(sig_bar2) and not na(sig_sl)
-    if sig_dir == 'LONG ↑'
-        if low <= sig_sl
-            sig_res := '❌ SL'
-            sig_res_bar := bar_index
-        else if high >= sig_tp
-            sig_res := '✅ TP'
-            sig_res_bar := bar_index
-    else
-        if high >= sig_sl
-            sig_res := '❌ SL'
-            sig_res_bar := bar_index
-        else if low <= sig_tp
-            sig_res := '✅ TP'
-            sig_res_bar := bar_index
+// Resolución de TODOS los planes abiertos cada vela. SL tiene prioridad si
+// SL y TP caen en la misma vela. El resultado se contabiliza por módulo.
+// Un plan entra al CIERRE de su vela de señal → se evalúa desde la siguiente.
+if array.size(p_dir) > 0
+    for i = array.size(p_dir) - 1 to 0
+        if bar_index > array.get(p_bar, i)
+            string d = array.get(p_dir, i)
+            float sl = array.get(p_sl, i)
+            float tp = array.get(p_tp, i)
+            string m = array.get(p_mod, i)
+            bool lost = false
+            bool won = false
+            if d == 'LONG ↑'
+                lost := low <= sl
+                won := not lost and high >= tp
+            else
+                lost := high >= sl
+                won := not lost and low <= tp
+            if lost or won
+                if m == 'pat'
+                    if lost
+                        l_pat += 1
+                    if won
+                        w_pat += 1
+                if m == 'wyck'
+                    if lost
+                        l_wyck += 1
+                    if won
+                        w_wyck += 1
+                if m == 'fib'
+                    if lost
+                        l_fib += 1
+                    if won
+                        w_fib += 1
+                if m == 'fvg'
+                    if lost
+                        l_fvg += 1
+                    if won
+                        w_fvg += 1
+                array.remove(p_dir, i), array.remove(p_sl, i), array.remove(p_tp, i), array.remove(p_mod, i), array.remove(p_bar, i)
 
 var string last_wyck = '—'
 var int last_wyck_bar = na
@@ -1027,14 +1148,37 @@ if er_short and confirmed
 // Estado/alertas = modo elegido + confirmación + ADX + veto de liquidez
 buy_signal = (signal_mode == 'Conservador' ? buy_conservative : buy_balanced) and confirmed and adx_ok and not liq_veto_long
 sell_signal = (signal_mode == 'Conservador' ? sell_conservative : sell_balanced) and confirmed and adx_ok and not liq_veto_short
+// Contadores por módulo: un contador en 0 tras mucho historial = módulo muerto.
+var int c_base = 0
+var int c_prem = 0
+var int c_pat = 0
+var int c_wyck = 0
+var int c_fib = 0
+var int c_fvg = 0
+var int c_veto = 0
+if buy_signal or sell_signal
+    c_base += 1
+if (buy_conservative or sell_conservative) and confirmed
+    c_prem += 1
+if pat_2b_long or pat_hsi_long or pat_2t_short or pat_hch_short
+    c_pat += 1
+if wyck_spring_long or wyck_test_long or wyck_upthrust_short or wyck_test_short
+    c_wyck += 1
+if fib_long or fib_short
+    c_fib += 1
+if fvg_long or fvg_short
+    c_fvg += 1
+if liq_veto_long or liq_veto_short
+    c_veto += 1
+
 
 // ============================================
 // GESTIÓN DE RIESGO + ENTRADAS/SALIDAS
 // ============================================
 stop_distance = risk_method == 'ATR' ? atr * atr_multiplier : close * (stop_loss_percent / 100)
 tp_distance = stop_distance * take_profit_multiplier
-stop_loss_buy_ref = low - stop_distance
-stop_loss_sell_ref = high + stop_distance
+stop_loss_buy_ref = close - stop_distance
+stop_loss_sell_ref = close + stop_distance
 
 long_exit = position_is_long and not na(last_sl_long) and not na(last_tp_long) and (close <= last_sl_long or close >= last_tp_long or bearish_trend or macd_bearish or rsi > rsi_exit_long)
 short_exit = position_is_short and not na(last_sl_short) and not na(last_tp_short) and (close >= last_sl_short or close <= last_tp_short or bullish_trend or macd_bullish or rsi < rsi_exit_short)
@@ -1120,14 +1264,11 @@ plotshape(fvg_short, '🕳️ FVG → SHORT', style=shape.square, location=locat
 // Solución: re-escalar cada serie a la volatilidad (desv. estándar) del SQZMOM.
 // El factor es siempre positivo → la forma, los ceros y los cruces se conservan.
 norm_ref = ta.stdev(val_sqz, 100)
-f_norm(float src) =>
-    s = ta.stdev(src, 100)
-    raw = normalize_panels and not na(s) and s > 0 ? src / s * norm_ref : src
-    // Clamp: un pico de liquidaciones (15-20 sigma) estiraría el autoscale
-    // del panel y aplastaría al SQZMOM contra el cero. Se acota a un múltiplo
-    // de la volatilidad del SQZMOM. Factor positivo → forma y ceros se conservan.
-    cap = liq_clamp_mult * norm_ref
-    normalize_panels and not na(cap) and cap > 0 ? math.max(-cap, math.min(cap, raw)) : raw
+// Factor ÚNICO para toda la familia MACD: los tres (MACD, Signal, Histograma)
+// se dividen por la MISMA σ(macd) → los cruces y histograma se conservan exactos.
+macd_scale = ta.stdev(macd, 100)
+f_norm_m(float src) =>
+    normalize_panels and not na(macd_scale) and macd_scale > 0 ? src / macd_scale * norm_ref : src
 
 // ============================================
 // PANEL: SQZMOM + MACD
@@ -1139,9 +1280,9 @@ plot(show_sqz ? 0 : na, 'SQZ Zero', color=scolor, style=plot.style_cross, linewi
 hline(0, 'SQZ Baseline', color=color.new(color.gray, 70))
 
 hist_color = histogram >= 0 ? (histogram[1] < histogram ? #26A69A : #B2DFDB) : (histogram[1] < histogram ? #FFCDD2 : #FF5252)
-plot(show_macd ? f_norm(macd) : na, 'MACD', color=#2962FF, linewidth=2)
-plot(show_macd ? f_norm(signal_line) : na, 'Signal', color=#FF6D00, linewidth=2)
-plot(show_macd ? f_norm(histogram) : na, 'Histogram', style=plot.style_columns, color=hist_color, linewidth=3)
+plot(show_macd ? f_norm_m(macd) : na, 'MACD', color=#2962FF, linewidth=2)
+plot(show_macd ? f_norm_m(signal_line) : na, 'Signal', color=#FF6D00, linewidth=2)
+plot(show_macd ? f_norm_m(histogram) : na, 'Histogram', style=plot.style_columns, color=hist_color, linewidth=3)
 hline(0, 'MACD Zero', color=color.new(color.gray, 70))
 
 
@@ -1185,23 +1326,37 @@ f_fromUSD(float val) => nz(val) / nz(tf_open, open)
 float shortLiqBase = nz(bn_usdt_buy) + nz(by_usdt_buy) + nz(okx_usdt_buy) + nz(okx_usdc_buy) + nz(drb_usdc_buy) + nz(htx_usdt_buy) + f_fromUSD(bn_usd_buy) + f_fromUSD(by_usd_buy) + f_fromUSD(bmx_usd_buy) + f_fromUSD(drb_usd_buy)
 float longLiqBase = nz(bn_usdt_sell) + nz(by_usdt_sell) + nz(okx_usdt_sell) + nz(okx_usdc_sell) + nz(drb_usdc_sell) + nz(htx_usdt_sell) + f_fromUSD(bn_usd_sell) + f_fromUSD(by_usd_sell) + f_fromUSD(bmx_usd_sell) + f_fromUSD(drb_usd_sell)
 
+// Factor ÚNICO para toda la familia de liquidaciones: shorts, longs y nubes se
+// escalan con la MISMA σ → se conserva la magnitud relativa entre lados.
+f_norm_a(float src) =>
+    float s = ta.stdev(shortLiqBase + longLiqBase, 100)
+    float rf = ta.stdev(val_sqz, 100)
+    float raw = normalize_panels and not na(s) and s > 0 ? src / s * rf : src
+    // Clamp: un día de cascada (15-20σ) no debe estirar el autoscale del panel
+    float cap = liq_clamp_mult * rf
+    normalize_panels and not na(cap) and cap > 0 ? math.min(raw, cap) : raw
+
 float shortLiqAcc = math.sum(shortLiqBase, i_window)
 float longLiqAcc = math.sum(longLiqBase, i_window)
 float cloudShort = i_cloud ? math.sum(shortLiqBase, i_cloud_len) : na
 float cloudLong = i_cloud ? math.sum(longLiqBase, i_cloud_len) : na
 
-plot(show_aggs ? f_norm(shortLiqAcc) : na, 'Short Liq (real)', color=i_col_short, style=plot.style_columns, linewidth=3)
-plot(show_aggs ? -f_norm(longLiqAcc) : na, 'Long Liq (real)', color=i_col_long, style=plot.style_columns, linewidth=3)
+plot(show_aggs ? f_norm_a(shortLiqAcc) : na, 'Short Liq (real)', color=i_col_short, style=plot.style_columns, linewidth=3)
+plot(show_aggs ? -f_norm_a(longLiqAcc) : na, 'Long Liq (real)', color=i_col_long, style=plot.style_columns, linewidth=3)
 pZero = plot(0, display=display.none, editable=false)
-pCloudS = plot(show_aggs and i_cloud ? f_norm(cloudShort) : na, 'Nube Short', color=color.new(i_col_short, 70))
-pCloudL = plot(show_aggs and i_cloud ? -f_norm(cloudLong) : na, 'Nube Long', color=color.new(i_col_long, 70))
+pCloudS = plot(show_aggs and i_cloud ? f_norm_a(cloudShort) : na, 'Nube Short', color=color.new(i_col_short, 70))
+pCloudL = plot(show_aggs and i_cloud ? -f_norm_a(cloudLong) : na, 'Nube Long', color=color.new(i_col_long, 70))
 fill(pZero, pCloudS, color=color.new(i_col_short, 85), title='Fill Nube Short')
 fill(pZero, pCloudL, color=color.new(i_col_long, 85), title='Fill Nube Long')
+
+// Win-rate helper (scope global: Pine no admite definir funciones dentro de bloques)
+f_wr(int w, int l) =>
+    str.tostring(w + l == 0 ? 0 : math.round(w * 100.0 / (w + l))) + '%'
 
 // ============================================
 // TABLA INFORMATIVA (24 filas, incluye liquidez)
 // ============================================
-var table info_table = table.new(position.top_left, 2, 20, bgcolor=color.new(#1a1a1a, 10), border_width=1, frame_color=color.new(#00C853, 70), frame_width=1)
+var table info_table = table.new(position.top_left, 2, 21, bgcolor=color.new(#1a1a1a, 10), border_width=1, frame_color=color.new(#00C853, 70), frame_width=1)
 
 if barstate.islast and show_table
     // 0: Header (modo + EMAs combinados)
@@ -1255,28 +1410,46 @@ if barstate.islast and show_table
     veto_txt = liq_veto_long ? '⛔ LONG' : liq_veto_short ? '⛔ SHORT' : '🟢 Libre'
     table.cell(info_table, 0, 14, '🛡️ Veto Liq', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 14, enable_liq_veto ? veto_txt : 'OFF', text_color=liq_veto_long or liq_veto_short ? #FF5252 : #00E676, text_size=size.small)
-    // 15: Patrones armados / disparados
-    pat_txt = hch_armed ? '⚠️ HCH ↓ SHORT' : dt_armed ? '⚠️ Doble techo ↓ SHORT' : hsi_armed ? '⚠️ HCHi ↑ LONG' : db_armed ? '⚠️ Doble suelo ↑ LONG' : '🟢 Ninguno'
-    table.cell(info_table, 0, 15, '📐 Patrón', text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 15, show_patterns ? pat_txt : 'OFF', text_color=(hch_armed or dt_armed or hsi_armed or db_armed) ? #FF9800 : #00E676, text_size=size.small)
+    // 15: TODOS los patrones armados simultáneamente (pueden coexistir largos y cortos)
+    pat_parts = (db_armed ? '2S↑ ' : '') + (hsi_armed ? 'HCHi↑ ' : '') + (dt_armed ? '2T↓ ' : '') + (hch_armed ? 'HCH↓ ' : '')
+    pat_txt = not struct_ok ? '⚪ TF < mínima' : pat_parts == '' ? '🟢 Ninguno' : '⚠️ ' + pat_parts
+    table.cell(info_table, 0, 15, '📐 Patrones', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 15, show_patterns ? pat_txt : 'OFF', text_color=not struct_ok ? color.gray : pat_parts == '' ? #00E676 : #FF9800, text_size=size.small)
     // 16: Último evento Wyckoff
     wyck_age = na(last_wyck_bar) ? '' : ' · hace ' + str.tostring(bar_index - last_wyck_bar) + 'v'
+    wyck_fresh = not na(last_wyck_bar) and bar_index - last_wyck_bar <= 40
     table.cell(info_table, 0, 16, '🌀 Wyckoff', text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 16, show_wyckoff ? last_wyck + wyck_age : 'OFF', text_color=last_wyck == '—' ? #00E676 : #FF9800, text_size=size.small)
+    table.cell(info_table, 1, 16, show_wyckoff and struct_ok ? (wyck_fresh ? last_wyck + wyck_age : '🟢 Ninguno') : 'OFF', text_color=not wyck_fresh or last_wyck == '—' ? #00E676 : #FF9800, text_size=size.small)
     // 17: Plan completo de la última señal de patrón/Wyckoff
-    sig_age = na(sig_bar2) ? '' : ' · hace ' + str.tostring(bar_index - sig_bar2) + 'v'
-    sig_res_txt = sig_res == '' ? ' → ⏳ ACTIVA' : ' → ' + sig_res + (na(sig_res_bar) ? '' : ' hace ' + str.tostring(bar_index - sig_res_bar) + 'v')
-    sig_txt = na(sig_e) ? '—' : sig_name + ' ' + sig_dir + ' @ ' + str.tostring(sig_e, format.mintick) + '\nSL ' + str.tostring(sig_sl, format.mintick) + ' · TP ' + str.tostring(sig_tp, format.mintick) + sig_age + sig_res_txt
+    // Plan activo más reciente de la lista (solo se muestra si sigue abierto)
+    float dsp_e = na
+    float dsp_sl = na
+    float dsp_tp = na
+    string dsp_d = ''
+    int dsp_b = na
+    if array.size(p_dir) > 0
+        int j = array.size(p_dir) - 1
+        dsp_e := close
+        dsp_sl := array.get(p_sl, j)
+        dsp_tp := array.get(p_tp, j)
+        dsp_d := array.get(p_dir, j)
+        dsp_b := array.get(p_bar, j)
+    dsp_age = na(dsp_b) ? '' : ' · hace ' + str.tostring(bar_index - dsp_b) + 'v'
+    sig_txt = na(dsp_e) ? '—' : sig_name + ' ' + dsp_d + ' @ ' + str.tostring(dsp_e, format.mintick) + '\nSL ' + str.tostring(dsp_sl, format.mintick) + ' · TP ' + str.tostring(dsp_tp, format.mintick) + dsp_age + ' → ⏳ ACTIVA'
     table.cell(info_table, 0, 17, '📌 Señal patrón', text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 17, sig_txt, text_color=na(sig_e) ? color.gray : sig_res == '✅ TP' ? #00E676 : sig_res == '❌ SL' ? #FF5252 : (sig_dir == 'LONG ↑' ? #4CAF50 : #F44336), text_size=size.small)
+    table.cell(info_table, 1, 17, sig_txt, text_color=na(dsp_e) ? color.gray : (dsp_d == 'LONG ↑' ? #4CAF50 : #F44336), text_size=size.small)
     // 18: Estado de retroceso Fib
-    fib_txt = not show_fib ? 'OFF' : in_zone_long ? '⚠️ Zona LONG · ' + str.tostring(ret_up, '#.##') : in_zone_short ? '⚠️ Zona SHORT · ' + str.tostring(ret_dn, '#.##') : '🟢 Fuera de zona'
+    fib_txt = not show_fib or not struct_ok ? 'OFF' : in_zone_long ? '⚠️ Zona LONG · ' + str.tostring(ret_up, '#.##') : in_zone_short ? '⚠️ Zona SHORT · ' + str.tostring(ret_dn, '#.##') : '🟢 Fuera de zona'
     table.cell(info_table, 0, 18, '🌊 Retroceso', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 18, fib_txt, text_color=(in_zone_long or in_zone_short) ? #FF9800 : #00E676, text_size=size.small)
     // 19: FVG activos
-    fvg_txt = not show_fvg ? 'OFF' : str.tostring(array.size(fvgU_top)) + '↑ · ' + str.tostring(array.size(fvgD_top)) + '↓'
+    fvg_txt = not show_fvg or not struct_ok ? 'OFF' : str.tostring(array.size(fvgU_top)) + '↑ · ' + str.tostring(array.size(fvgD_top)) + '↓'
     table.cell(info_table, 0, 19, '🕳️ FVG activos', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 19, fvg_txt, text_color=color.white, text_size=size.small)
+    // 20: Contadores históricos por módulo (0 = módulo que nunca dispara)
+    cnt_txt = 'B:' + str.tostring(c_base) + ' P:' + str.tostring(c_prem) + ' 📐:' + str.tostring(c_pat) + '(' + f_wr(w_pat, l_pat) + ') 🌀:' + str.tostring(c_wyck) + '(' + f_wr(w_wyck, l_wyck) + ') 🌊:' + str.tostring(c_fib) + '(' + f_wr(w_fib, l_fib) + ') 🕳️:' + str.tostring(c_fvg) + '(' + f_wr(w_fvg, l_fvg) + ')'
+    table.cell(info_table, 0, 20, '🧪 Históricas', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 20, cnt_txt, text_color=color.white, text_size=size.small)
 
 // ============================================
 // ALERTAS
