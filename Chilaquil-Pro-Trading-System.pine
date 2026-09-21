@@ -1,8 +1,20 @@
 
-
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// CHILAQUIL PRO SUITE — V8.6
+// CHILAQUIL PRO SUITE — V8.9
+// V8.7 (revisión sobre V8.6):
+//   (1) Inputs nuevos (late_pct, pat_prox_atr, use_late) AL FINAL de la lista:
+//       TradingView guarda los ajustes por orden de declaración; meterlos en
+//       medio desalineaba los ~100 inputs siguientes de un indicador ya cargado.
+//   (2) Interruptor use_late (medir el filtro de agotamiento con/sin) + estado
+//       TARDE visible en la tabla (fila 14).
+//   (3) Sombra del veto (id 5) y contador c_blk excluyen agotadas → la ablación
+//       del veto vuelve a comparar poblaciones iguales.
+//   (4) Tablas sin NINGÚN icono (quedaba uno en la cabecera y otro en LONG/SHORT).
+//   (5) Letras de señal legibles en tema claro y oscuro con marcadores OFF.
+//   (6) Necklines: mismo gating show_patterns en las 4 y siempre en el nivel vigente.
+//   (7) "SL TOCADO" solo desde la barra siguiente a la señal (igual que la resolución).
+//   (8) add() del heatmap corta al fusionar; textos y contratos alineados al código.
 // V8.6: (1) FVG: la ventana oculta SOLO el dibujo (lógica y stats en todo el
 //   historial) y sigue el modo de inicio del heatmap (Auto/Manual/Todo);
 //   (2) alertas de PROXIMIDAD a neckline armada (armado → cercanía → ruptura);
@@ -28,15 +40,26 @@
 // Restricción de Pine: las funciones NO pueden mutar globales → el estado se
 // gestiona con asignaciones en scope global; los métodos UDT solo mutan su
 // propia instancia. Cualquier refactor a funciones debe respetar esto.
+// Regla de inputs: los inputs NUEVOS se declaran siempre AL FINAL de la lista
+// (TradingView los identifica por orden de declaración).
 //
-// f_norm(src) -> float : src re-escalado a σ100(SQZMOM), clamp ±(3.5σ).
-//   Conserva ceros y forma. La familia MACD usa f_norm_m (factor ÚNICO σ(macd))
-//   para conservar TAMBIÉN sus cruces internos y el histograma.
+// f_norm_a(src, n) -> float : liquidaciones re-escaladas a σ100(SQZMOM), clamp ±(3.5σ).
+//   Conserva ceros y forma. f_norm_m (factor ÚNICO σ(macd)) normaliza la familia
+//   MACD para conservar TAMBIÉN sus cruces internos y el histograma.
+//   PLOTS (V8.9): 6 fuente (EMA×3, SQZMOM, liq×2). Señales como LABELS
+//   (tope 40 en ring buffer, límite TV 100). Líneas: 4 necklines + 2 pivots +
+//   base 0. Alertas: 26. Conteo runtime estimado: 2(6)+26+7+1 = 46/64.
+//   Cableados sin coste: show_pivot_levels y show_risk_management. Sin cablear
+//   por presupuesto: show_macd, show_sig_bal, i_cloud.
 // base_long  = EMAs alineadas ∧ MACD>signal ∧ SQZMOM rising ∧ RSI∈[40,65] ∧
 //   close>highest(high,20)[1] ∧ ¬(pivote persistido a <2 ATR de distancia).
 // base_short = espejo exacto (RSI∈[35,60]).
-// operación  = base(modo) ∧ confirmed(cierre de vela) ∧ adx_ok ∧ ¬veto_liq.
+// operación  = base(modo) ∧ confirmed(cierre de vela) ∧ adx_ok ∧ htf_ok ∧ ¬veto_liq ∧ ¬agotada.
 // veto_liq   = cluster fuerte (≥ liq_veto_str% de la máx.) a <1.0× stop del precio.
+// agotada(lado) = use_late ∧ (plan abierto de módulos 0-4 o posición activa del MISMO
+//   lado con progreso ≥ late_pct del camino a su TP). Suprime ENTRADAS/señales de
+//   ese lado (no las salidas); la formación/gap/pierna/patrón se CONSUME igualmente.
+//   Premium (prem_*_edge) no se suprime: es familia independiente.
 // UDT liquidation: add() suma contratos si el nivel existe; sqz() elimina y
 //   reporta niveles barridos; correct_history() purga invalidados hacia atrás;
 //   sort() ordena prices para búsqueda de vecinos; update_color() aplica
@@ -44,6 +67,7 @@
 // M4 patrones : ARMED = 3 pivotes con |hombros|≤1.5 ATR, cabeza ≥1 ATR, simetría ≤2.5×
 //   y profundidad del valle ≥1 ATR. Exclusión mutua HCH/doble techo.
 //   TRIGGER = cierre a través de la neckline (valle/techo desde la cabeza al armar).
+//   PROXIMIDAD = armado ∧ precio a <pat_prox_atr ATR de la neckline (1 aviso por armado).
 //   Nota: el valle empieza en k=pat_pivot → el gatillo puede llegar hasta
 //   pat_pivot barras tarde si la ruptura ocurrió antes de confirmar el pivote.
 // M5 wyckoff  : spring/upthrust = falsa ruptura de lowest/highest[1] del rango
@@ -96,7 +120,6 @@ take_profit_multiplier = input.float(2.0, 'Multiplicador T/P (R/R)', group='Gest
 fee_pct = input.float(0.05, 'Comisión por lado (%) — solo diagnóstico', group='Gestión de Riesgo', minval=0.0, maxval=0.5, step=0.01, tooltip='Se descuenta ida y vuelta del R de cada plan. Los stops cortos pagan proporcionalmente más.')
 one_at_a_time = input.bool(true, 'Un plan abierto por módulo y lado', group='Gestión de Riesgo', tooltip='Señales solapadas comparten resultado; contarlas como independientes infla n y da falsa confianza.')
 plan_max_bars = input.int(0, 'Caducidad de planes (barras, 0 = auto)', group='Gestión de Riesgo', minval=0, maxval=1000, tooltip='Un plan que no toca SL ni TP en este tiempo se cierra a mercado (R parcial).')
-late_pct = input.float(0.7, 'Suprimir entradas agotadas (% del camino al TP)', group='Gestión de Riesgo', minval=0.3, maxval=0.95, step=0.05, tooltip='Si un plan abierto (módulos 0-4) o la posición activa del mismo lado ya recorrió este % del camino a su TP, no se generan nuevas señales/entradas en ese lado: queda poco recorrido para el riesgo completo (R/R invertido). Las SALIDAS nunca se suprimen. Independiente del aviso "TARDE" de la fila 17 (50%).')
 
 ema_fast = input.int(7, 'EMA Rápida (3 EMAs)', group='EMA')
 ema_medium = input.int(15, 'EMA Media (3 EMAs)', group='EMA')
@@ -131,7 +154,6 @@ auto_pat_cfg = input.bool(true, '🔧 Auto-ajuste por temporalidad (patrones + W
 pat_sh_tol = input.float(1.5, 'Tolerancia hombros/máximos (ATR)', group='PATRONES 📐', minval=0.3, maxval=5.0, step=0.1)
 pat_head_min = input.float(1.0, 'Prominencia mínima cabeza (ATR)', group='PATRONES 📐', minval=0.3, maxval=5.0, step=0.1)
 pat_rr_mult = input.float(2.0, 'R/R objetivo (patrones y Wyckoff)', group='PATRONES 📐', minval=1.0, maxval=5.0, step=0.5, tooltip='El TP de cada señal de patrón = riesgo (entrada→SL) multiplicado por este R/R. El SL se coloca en el extremo del patrón + 0.5 ATR de colchón.')
-pat_prox_atr = input.float(0.5, 'Aviso de proximidad a neckline (ATR)', group='PATRONES 📐', minval=0.1, maxval=3.0, step=0.1, tooltip='Cuando el precio queda a esta distancia de la neckline de un patrón ARMADO, dispara la alerta "ACERCÁNDOSE" (una vez por armado). Es el momento de bajar al TF de ejecución: armado → cercanía → ruptura.')
 show_wyckoff = input.bool(true, 'Detectar eventos Wyckoff', group='WYCKOFF 🌀', tooltip='Eventos mecánicos del método: rupturas falsas de rango + absorción. Señales independientes, no repintan.')
 wyck_len_manual = input.int(60, 'Rango (barras) — manual', group='WYCKOFF 🌀', minval=20, maxval=300, tooltip='Tamaño de la estructura de rango que se evalúa.')
 wyck_cool_manual = input.int(20, 'Enfriamiento — manual', group='WYCKOFF 🌀', minval=5, maxval=100)
@@ -178,8 +200,9 @@ lev3_manual = input.int(10, 'Lev 3 (manual)', group='HEATMAP ⚡', minval=0)
 ltf_manual = input.timeframe('5', 'Intrabar Resolution (manual)', group='HEATMAP ⚡', tooltip='Menor = más preciso pero más pesado')
 scale_ticks_manual = input.int(500, 'Scale en ticks (manual)', group='HEATMAP ⚡', minval=10, tooltip='Ancho de cada nivel = mintick × ticks')
 // Se guardan niveles LONG y SHORT por separado. El límite de TradingView es
-// 500 boxes, por lo que 240 por lado deja margen para crear y borrar niveles.
-storage_size = input.int(200, 'Niveles a almacenar', group='HEATMAP ⚡', minval=10, maxval=220, tooltip='Máximo 240 por lado para no exceder el límite de 500 boxes')
+// 500 boxes: 2 lados × 220 (máximo) + hasta 50 cajas FVG = 490, con margen
+// para crear y borrar niveles dentro de la misma vela.
+storage_size = input.int(200, 'Niveles a almacenar', group='HEATMAP ⚡', minval=10, maxval=220, tooltip='Máximo 220 por lado (2 × 220 + hasta 50 cajas FVG = 490, bajo el límite de 500 boxes)')
 disp = input.float(20, 'Dispersion Factor (%)', minval=0, maxval=100, group='HEATMAP ⚡', tooltip='% de contratos disperso al lado opuesto') / 100
 filter_peaks = input.bool(false, 'Filtrar por señal de OI', group='HEATMAP ⚡')
 sig_m = input.float(1, 'Mult', group='HEATMAP ⚡')
@@ -210,6 +233,15 @@ i_col_short = input.color(color.new(#ef5350, 20), 'Color Short Liq.', group='AGG
 i_col_long = input.color(color.new(#26a69a, 20), 'Color Long Liq.', group='AGG LIQ 📊 · Display')
 i_cloud = input.bool(true, 'Mostrar Nube Acumulada', group='AGG LIQ 📊 · Display')
 i_cloud_len = input.int(20, 'Ventana nube (barras)', minval=2, maxval=500, group='AGG LIQ 📊 · Display')
+
+// ============================================
+// INPUTS AÑADIDOS DESPUÉS — SIEMPRE AL FINAL DE LA LISTA
+// (TradingView identifica cada input por su orden de declaración: insertar uno
+// en medio desalinea los ajustes guardados de todos los siguientes.)
+// ============================================
+late_pct = input.float(0.7, 'Suprimir entradas agotadas (% del camino al TP)', group='Gestión de Riesgo', minval=0.3, maxval=0.95, step=0.05, tooltip='Si un plan abierto (módulos 0-4) o la posición activa del mismo lado ya recorrió este % del camino a su TP, no se generan nuevas señales/entradas en ese lado: queda poco recorrido para el riesgo completo (R/R invertido). Las SALIDAS nunca se suprimen. Independiente del aviso "TARDE" de la fila 17 (50%). Se apaga con el interruptor "Filtro de entradas agotadas".')
+use_late = input.bool(true, 'Filtro de entradas agotadas (ON/OFF)', group='Gestión de Riesgo', tooltip='OFF = desactiva por completo la supresión por agotamiento (para medir el sistema con y sin filtro comparando la tabla de diagnóstico). La fila 14 de la tabla muestra TARDE cuando hay supresión activa.')
+pat_prox_atr = input.float(0.5, 'Aviso de proximidad a neckline (ATR)', group='PATRONES 📐', minval=0.1, maxval=3.0, step=0.1, tooltip='Cuando el precio queda a esta distancia de la neckline de un patrón ARMADO, dispara la alerta "ACERCÁNDOSE" (una vez por armado). Es el momento de bajar al TF de ejecución: armado → cercanía → ruptura.')
 
 // ============================================
 // AUTO-DETECT TEMPORALIDAD + AUTO-CONFIG HEATMAP
@@ -396,6 +428,31 @@ near_resistance = enable_pivot_filter and not na(last_ph) and close < last_ph an
 near_support = enable_pivot_filter and not na(last_pl) and close > last_pl and (close - last_pl) < safety_dist
 res_dist_atr = not na(last_ph) and close < last_ph and atr > 0 ? (last_ph - close) / atr : na
 sup_dist_atr = not na(last_pl) and close > last_pl and atr > 0 ? (close - last_pl) / atr : na
+// Niveles del último pivote (control show_pivot_levels, cableado V8.8.1):
+// LÍNEAS con extend.right — mismo efecto visual SIN consumir el cupo de plots
+// (agotado: el runtime de TV cuenta ~×3 y 23+ plots fuente revientan RE10140).
+var line ln_ph = na
+var line ln_pl = na
+if show_pivot_levels and not na(last_ph)
+    if na(ln_ph)
+        ln_ph := line.new(bar_index, last_ph, bar_index, last_ph, color=color.new(#EC407A, 0), style=line.style_dashed, extend=extend.right, force_overlay=true)
+    else
+        ln_ph.set_y1(last_ph)
+        ln_ph.set_y2(last_ph)
+        ln_ph.set_x1(bar_index)
+if not show_pivot_levels and not na(ln_ph)
+    line.delete(ln_ph)
+    ln_ph := na
+if show_pivot_levels and not na(last_pl)
+    if na(ln_pl)
+        ln_pl := line.new(bar_index, last_pl, bar_index, last_pl, color=color.new(#00E676, 0), style=line.style_dashed, extend=extend.right, force_overlay=true)
+    else
+        ln_pl.set_y1(last_pl)
+        ln_pl.set_y2(last_pl)
+        ln_pl.set_x1(bar_index)
+if not show_pivot_levels and not na(ln_pl)
+    line.delete(ln_pl)
+    ln_pl := na
 
 // Extremos de RSI de los últimos 5 barras: el motor de Premium exige
 // sobreventa/sobrecompra reciente (no necesariamente en la vela actual) con el
@@ -525,40 +582,50 @@ pat_hsi_long_raw = hsi_armed and close > hsi_ref
 pat_2b_long_raw = db_armed and close > db_ref
 
 // ── Necklines de patrones ARMADOS como LÍNEAS (no consumen el cupo de plots) ──
+// Las 4 siguen la misma regla: crear solo con show_patterns ON; BORRAR siempre
+// que el patrón se desarme o se apague el módulo. Mientras están armadas, la
+// línea se reancla cada barra al nivel VIGENTE (un doble techo/suelo puede
+// re-armarse con otra neckline sin pasar por "desarmado").
 var line ln_hch = na
 var line ln_dt = na
 var line ln_hsi = na
 var line ln_db = na
 if struct_ok
-    // Crear solo con show_patterns ON; BORRAR siempre que el patrón se desarme
-    // o el usuario apague el módulo (evita líneas congeladas al cambiar inputs).
     if show_patterns and hch_armed and not hch_armed[1]
         ln_hch := line.new(bar_index, hch_ref, bar_index + 20, hch_ref, color=#EC407A, style=line.style_dashed, force_overlay=true)
     if (not show_patterns or not hch_armed) and not na(ln_hch)
         line.delete(ln_hch)
         ln_hch := na
     if show_patterns and hch_armed and not na(ln_hch)
+        ln_hch.set_y1(hch_ref)
+        ln_hch.set_y2(hch_ref)
         ln_hch.set_x2(bar_index + 20)
-    if dt_armed and not dt_armed[1]
+    if show_patterns and dt_armed and not dt_armed[1]
         ln_dt := line.new(bar_index, dt_ref, bar_index + 20, dt_ref, color=#EC407A, style=line.style_dashed, force_overlay=true)
     if (not show_patterns or not dt_armed) and not na(ln_dt)
         line.delete(ln_dt)
         ln_dt := na
     if show_patterns and dt_armed and not na(ln_dt)
+        ln_dt.set_y1(dt_ref)
+        ln_dt.set_y2(dt_ref)
         ln_dt.set_x2(bar_index + 20)
-    if hsi_armed and not hsi_armed[1]
+    if show_patterns and hsi_armed and not hsi_armed[1]
         ln_hsi := line.new(bar_index, hsi_ref, bar_index + 20, hsi_ref, color=#FF6D00, style=line.style_dashed, force_overlay=true)
     if (not show_patterns or not hsi_armed) and not na(ln_hsi)
         line.delete(ln_hsi)
         ln_hsi := na
     if show_patterns and hsi_armed and not na(ln_hsi)
+        ln_hsi.set_y1(hsi_ref)
+        ln_hsi.set_y2(hsi_ref)
         ln_hsi.set_x2(bar_index + 20)
-    if db_armed and not db_armed[1]
+    if show_patterns and db_armed and not db_armed[1]
         ln_db := line.new(bar_index, db_ref, bar_index + 20, db_ref, color=#FF6D00, style=line.style_dashed, force_overlay=true)
     if (not show_patterns or not db_armed) and not na(ln_db)
         line.delete(ln_db)
         ln_db := na
     if show_patterns and db_armed and not na(ln_db)
+        ln_db.set_y1(db_ref)
+        ln_db.set_y2(db_ref)
         ln_db.set_x2(bar_index + 20)
 
 // ── AVISO DE PROXIMIDAD a la neckline (momento de bajar al TF de ejecución) ──
@@ -840,6 +907,9 @@ method add(liquidation l, box lvl, float contracts, float price) =>
                 // calientes se estiran hacia "ahora" y el heatmap vuelve a ser ancho)
                 _lvl.set_left(math.max(0, bar_index - liq_extend))
                 l.liq.set(i, liq_lvl.new(_lvl, _contracts + contracts))
+                // Los precios de los buckets son únicos por construcción: no hace
+                // falta seguir recorriendo el resto una vez fusionado.
+                break
     if not overlap
         l.liq.push(liq_lvl.new(lvl, contracts))
         l.prices.push(price)
@@ -910,7 +980,6 @@ method update_color(liq_lvl[] liq) =>
             box b = liq.get(i).lvl
             // Aplicar la transparencia configurada (antes se pisaba con el color opaco)
             b.set_bgcolor(color.new(c, liq_transp))
-            b.set_border_color(c)
             // Altura dinámica: los clusters intensos se dibujan GRUESOS
             // (estilo Coinglass). Se recentra sobre el precio del nivel.
             float mid = (b.get_top() + b.get_bottom()) / 2
@@ -1111,6 +1180,7 @@ prem_sell_edge = sell_conservative and not sell_conservative[1]
 buy_balanced = bullish_trend and macd_bullish and sqz_bullish and rsi_ok_long and breakout_long and not near_resistance
 sell_balanced = bearish_trend and macd_bearish and sqz_bearish and rsi_ok_short and breakdown_short and not near_support
 
+
 confirmed = wait_close ? barstate.isconfirmed : true
 // Patrones: gatillo + confirmación de cierre (anti-repintado). Se desarman al
 // disparar AUNQUE la señal se suprima por agotamiento: la formación se consumió.
@@ -1170,8 +1240,9 @@ f_move_exhausted(string d) =>
     ex
 
 // Supresión de entradas AGOTADAS (ver f_move_exhausted). Las SALIDAS no se tocan.
-ex_long = f_move_exhausted('LONG ↑')
-ex_short = f_move_exhausted('SHORT ↓')
+// use_late = interruptor para medir el sistema con y sin este filtro.
+ex_long = use_late and f_move_exhausted('LONG ↑')
+ex_short = use_late and f_move_exhausted('SHORT ↓')
 pat_hch_short = pat_hch_short_hit and not ex_short
 pat_2t_short = pat_2t_short_hit and not ex_short
 pat_hsi_long = pat_hsi_long_hit and not ex_long
@@ -1315,13 +1386,13 @@ sell_signal = core_ok_short and not liq_veto_short and not ex_short
 // Contadores por módulo: un contador en 0 tras mucho historial = módulo muerto.
 var int c_base = 0
 var int c_prem = 0
-var int c_blk = 0    // señales válidas que el veto bloqueó
+var int c_blk = 0    // señales válidas que el veto bloqueó (excluye agotadas: misma población que el plan sombra id 5)
 var int c_late = 0   // señales suprimidas por movimiento agotado (TP cercano)
 if buy_signal or sell_signal
     c_base += 1
 if (prem_buy_edge or prem_sell_edge) and confirmed
     c_prem += 1
-if (core_ok_long and liq_veto_long) or (core_ok_short and liq_veto_short)
+if (core_ok_long and liq_veto_long and not ex_long) or (core_ok_short and liq_veto_short and not ex_short)
     c_blk += 1
 if (core_ok_long and not liq_veto_long and ex_long) or (core_ok_short and not liq_veto_short and ex_short)
     c_late += 1
@@ -1402,14 +1473,16 @@ if sell_signal and not position_is_short
     last_fam_short := signal_mode
 
 // Núcleo y sombra del veto por SEÑAL (misma regla que ids 6 y 7 → ablación entre iguales).
+// El plan sombra (id 5) aplica el MISMO filtro de agotamiento que el núcleo (id 4):
+// la única diferencia entre ambos es el veto de liquidez.
 // El R real de la máquina de estados se mide aparte en "Núcleo REAL".
 if buy_signal
     f_push_plan('LONG ↑', close, close - stop_distance, close + tp_distance, 4, 'Núcleo')
 if sell_signal
     f_push_plan('SHORT ↓', close, close + stop_distance, close - tp_distance, 4, 'Núcleo')
-if core_ok_long and liq_veto_long
+if core_ok_long and liq_veto_long and not ex_long
     f_push_plan('LONG ↑', close, close - stop_distance, close + tp_distance, 5, 'Núcleo vetada')
-if core_ok_short and liq_veto_short
+if core_ok_short and liq_veto_short and not ex_short
     f_push_plan('SHORT ↓', close, close + stop_distance, close - tp_distance, 5, 'Núcleo vetada')
 
 // Ablación: ¿aportan los filtros sobre el breakout simple? (mismo SL/TP que el núcleo)
@@ -1432,26 +1505,53 @@ plot(show_ema ? ema_fast_line : na, 'EMA Rápida (7/100 auto)', color=#2962FF, l
 plot(show_ema ? ema_slow_line : na, 'EMA Lenta (25/200 auto)', color=#00C853, linewidth=2, force_overlay=true)
 plot(show_ema and not use_2_emas ? ema_medium_line : na, 'EMA Media', color=#FF6D00, linewidth=2, force_overlay=true)
 
-// Ambas familias SIEMPRE visibles — no hace falta cambiar de modo para verlas.
-// Círculos = Equilibrado (más frecuentes) · Triángulos 💠 = Premium (RSI<=30/>=70, raras)
-plotshape(sig_show and show_signals and show_sig_prem and prem_buy_edge and confirmed, '💠 COMPRA Premium', shape.triangleup, location.belowbar, show_markers ? #00E5FF : color.new(color.white, 100), size=size.normal, force_overlay=true)
-plotshape(sig_show and show_signals and show_sig_prem and prem_sell_edge and confirmed, '🛑 VENTA Premium', shape.triangledown, location.abovebar, show_markers ? #FF1744 : color.new(color.white, 100), size=size.normal, force_overlay=true)
-
-// ── Señales de PATRONES (apartado independiente de los indicadores) ──
-plotshape(sig_show and show_patterns and pat_2b_long, 'Doble suelo → LONG', style=shape.diamond, location=location.belowbar, color=show_markers ? #FF6D00 : color.new(color.white, 100), size=size.normal, text='2S', textcolor=color.white, force_overlay=true)
-plotshape(sig_show and show_patterns and pat_hsi_long, 'HCH invertida → LONG', style=shape.diamond, location=location.belowbar, color=show_markers ? #FF6D00 : color.new(color.white, 100), size=size.normal, text='HCHi', textcolor=color.white, force_overlay=true)
-plotshape(sig_show and show_patterns and pat_2t_short, 'Doble techo → SHORT', style=shape.diamond, location=location.abovebar, color=show_markers ? #EC407A : color.new(color.white, 100), size=size.normal, text='2T', textcolor=color.white, force_overlay=true)
-plotshape(sig_show and show_patterns and pat_hch_short, 'HCH → SHORT', style=shape.diamond, location=location.abovebar, color=show_markers ? #EC407A : color.new(color.white, 100), size=size.normal, text='HCH', textcolor=color.white, force_overlay=true)
-
-// ── Señales de WYCKOFF (apartado independiente) ──
-plotshape(sig_show and wyck_spring_long, 'Spring → LONG', style=shape.circle, location=location.belowbar, color=show_markers ? #00E676 : color.new(color.white, 100), size=size.normal, text='SP', textcolor=color.black, force_overlay=true)
-plotshape(sig_show and wyck_test_long, 'Test de Spring → LONG', style=shape.circle, location=location.belowbar, color=show_markers ? #69F0AE : color.new(color.white, 100), size=size.small, text='T', textcolor=color.black, force_overlay=true)
-plotshape(sig_show and wyck_upthrust_short, 'Upthrust → SHORT', style=shape.circle, location=location.abovebar, color=show_markers ? #FF1744 : color.new(color.white, 100), size=size.normal, text='UT', textcolor=color.white, force_overlay=true)
-plotshape(sig_show and wyck_test_short, 'Test de Upthrust → SHORT', style=shape.circle, location=location.abovebar, color=show_markers ? #FF8A80 : color.new(color.white, 100), size=size.small, text='T', textcolor=color.black, force_overlay=true)
-plotshape(sig_show and fib_long, 'Retroceso → LONG', style=shape.triangleup, location=location.belowbar, color=show_markers ? #FFD600 : color.new(color.white, 100), size=size.normal, text='FR', textcolor=color.black, force_overlay=true)
-plotshape(sig_show and fib_short, 'Retroceso → SHORT', style=shape.triangledown, location=location.abovebar, color=show_markers ? #FFD600 : color.new(color.white, 100), size=size.normal, text='FR', textcolor=color.black, force_overlay=true)
-plotshape(sig_show and fvg_long, 'FVG → LONG', style=shape.square, location=location.belowbar, color=show_markers ? #00B0FF : color.new(color.white, 100), size=size.small, text='FVG', textcolor=color.black, force_overlay=true)
-plotshape(sig_show and fvg_short, 'FVG → SHORT', style=shape.square, location=location.abovebar, color=show_markers ? #00B0FF : color.new(color.white, 100), size=size.small, text='FVG', textcolor=color.black, force_overlay=true)
+// LETRAS DE SEÑAL como LABELS (V8.9): los 14 plotshape consumían el doble de
+// plots en el runtime de TV (RE10140: contados = 2×plots + alertas + líneas + 1).
+// Los labels NO cuentan como plot y con force_overlay van sobre el precio (igual
+// que los plotshape viejos). Con marcadores OFF (modo letras) se ve igual;
+// con marcadores ON ahora también son letras (no hay figuras sin plot en Pine).
+var array<label> sig_labels = array.new<label>()
+f_sig_lbl(float y, string t, color c, bool below) =>
+    label lb = label.new(bar_index, y, t, style=below ? label.style_label_up : label.style_label_down, color=color.new(c, 100), textcolor=c, size=size.small, force_overlay=true)
+    array.push(sig_labels, lb)
+    if array.size(sig_labels) > 40
+        array.shift(sig_labels).delete()
+// Si se apaga la ventana de señales, limpiar las letras históricas
+if not sig_show and array.size(sig_labels) > 0
+    for i = array.size(sig_labels) - 1 to 0
+        array.get(sig_labels, i).delete()
+    array.clear(sig_labels)
+// Familias del núcleo: 💠 Premium (flanco) y letras de módulos
+if sig_show and show_signals and show_sig_prem and prem_buy_edge and confirmed
+    f_sig_lbl(low, '💠', #00E5FF, true)
+if sig_show and show_signals and show_sig_prem and prem_sell_edge and confirmed
+    f_sig_lbl(high, '🛑', #FF1744, false)
+// ── Señales de PATRONES ──
+if sig_show and show_patterns and pat_2b_long
+    f_sig_lbl(low, '2S', #FF6D00, true)
+if sig_show and show_patterns and pat_hsi_long
+    f_sig_lbl(low, 'HCHi', #FF6D00, true)
+if sig_show and show_patterns and pat_2t_short
+    f_sig_lbl(high, '2T', #EC407A, false)
+if sig_show and show_patterns and pat_hch_short
+    f_sig_lbl(high, 'HCH', #EC407A, false)
+// ── Señales de WYCKOFF ──
+if sig_show and wyck_spring_long
+    f_sig_lbl(low, 'SP', #00E676, true)
+if sig_show and wyck_test_long
+    f_sig_lbl(low, 'T', #69F0AE, true)
+if sig_show and wyck_upthrust_short
+    f_sig_lbl(high, 'UT', #FF1744, false)
+if sig_show and wyck_test_short
+    f_sig_lbl(high, 'T', #FF8A80, false)
+if sig_show and fib_long
+    f_sig_lbl(low, 'FR', #FFD600, true)
+if sig_show and fib_short
+    f_sig_lbl(high, 'FR', #FFD600, false)
+if sig_show and fvg_long
+    f_sig_lbl(low, 'FVG', #00B0FF, true)
+if sig_show and fvg_short
+    f_sig_lbl(high, 'FVG', #00B0FF, false)
 
 // ═══ NORMALIZACIÓN DE ESCALAS DEL PANEL ═══
 // Un solo panel = un solo eje de precios. Las liquidaciones agregadas de BTC
@@ -1471,9 +1571,15 @@ f_norm_m(float src) =>
 bcolor = val_sqz > 0 ? (val_sqz > nz(val_sqz[1]) ? color.lime : color.rgb(37, 87, 39)) : (val_sqz < nz(val_sqz[1]) ? color.red : color.rgb(185, 105, 13))
 scolor = noSqz ? color.blue : sqzOn ? color.black : color.gray
 plot(show_sqz ? val_sqz : na, 'SQZMOM', color=bcolor, style=plot.style_histogram, linewidth=4)
-hline(0, 'SQZ Baseline', color=color.new(color.gray, 70))
+// Línea base 0 como LINE (V8.9): hline contaba como plot; la línea no.
+var line ln_zero = na
+if na(ln_zero)
+    ln_zero := line.new(bar_index, 0, bar_index, 0, color=color.new(color.gray, 70), extend=extend.right)
 
 hist_color = histogram >= 0 ? (histogram[1] < histogram ? #26A69A : #B2DFDB) : (histogram[1] < histogram ? #FFCDD2 : #FF5252)
+
+// show_macd SIN CABLEAR (V8.8.1): 3 plots más revientan el límite RE10140
+// (el runtime cuenta ~×3). El estado MACD ya se muestra en la fila 3 de la tabla.
 
 
 // ═══════════════════════════════════════════════════════════
@@ -1564,16 +1670,17 @@ float cloudLong = i_cloud ? math.sum(longLiqBase, i_cloud_len) : na
 
 plot(show_aggs ? f_norm_a(shortLiqAcc, i_window) : na, 'Short Liq (real)', color=i_col_short, style=plot.style_columns, linewidth=3)
 plot(show_aggs ? -f_norm_a(longLiqAcc, i_window) : na, 'Long Liq (real)', color=i_col_long, style=plot.style_columns, linewidth=3)
+// i_cloud SIN CABLEAR (V8.8.1): 2 plots más revientan el límite RE10140.
 
 // ============================================
-// TABLA INFORMATIVA (24 filas, incluye liquidez)
+// TABLA INFORMATIVA (20 filas, incluye liquidez)
 // ============================================
 var table info_table = table.new(position.top_left, 2, 20, bgcolor=color.new(#1a1a1a, 10), border_width=1, frame_color=color.new(#00C853, 70), frame_width=1)
 
 if barstate.islast and show_table
     // 0: Header (modo + EMAs combinados)
     table.cell(info_table, 0, 0, ' CHILAQUIL PRO', text_color=color.white, bgcolor=color.new(#00C853, 30), text_size=size.small)
-    table.cell(info_table, 1, 0, (signal_mode == 'Conservador' ? ' Conserv.' : '🟡 Equil.') + ' · ' + (use_2_emas ? str.tostring(ema_long_fast) + '/' + str.tostring(ema_long_slow) : str.tostring(ema_fast) + '/' + str.tostring(ema_medium) + '/' + str.tostring(ema_slow)), text_color=#FFC107, bgcolor=color.new(#00C853, 30), text_size=size.small)
+    table.cell(info_table, 1, 0, (signal_mode == 'Conservador' ? ' Conserv.' : ' Equil.') + ' · ' + (use_2_emas ? str.tostring(ema_long_fast) + '/' + str.tostring(ema_long_slow) : str.tostring(ema_fast) + '/' + str.tostring(ema_medium) + '/' + str.tostring(ema_slow)), text_color=#FFC107, bgcolor=color.new(#00C853, 30), text_size=size.small)
     // 1: Tendencia
     table.cell(info_table, 0, 1, 'Tendencia', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 1, bullish_trend ? ' ALCISTA' : bearish_trend ? ' BAJISTA' : ' NEUTRAL', text_color=bullish_trend ? #00E676 : bearish_trend ? #FF5252 : #FFA726, text_size=size.small)
@@ -1596,19 +1703,20 @@ if barstate.islast and show_table
     // 7: Riesgo
     table.cell(info_table, 0, 7, 'Riesgo', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 7, risk_method == 'ATR' ? 'ATR×' + str.tostring(atr_multiplier, '#.#') + ' RR×' + str.tostring(take_profit_multiplier, '#.#') : '%' + str.tostring(stop_loss_percent, '#.#') + ' RR×' + str.tostring(take_profit_multiplier, '#.#'), text_color=#FFC107, text_size=size.small)
-    // 8: POSICIÓN
-    is_long_active = position_is_long and not na(last_entry_price_long)
-    is_short_active = position_is_short and not na(last_entry_price_short)
-    table.cell(info_table, 0, 8, '── POSICIÓN ──', text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
-    table.cell(info_table, 1, 8, is_long_active ? 'LONG ACTIVA' : is_short_active ? 'SHORT ACTIVA' : '—', text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
-    // 9: LONG (entrada + R/R + SL/TP en una celda)
-    long_txt = is_long_active ? (last_fam_long == 'Conservador' ? 'PREMIUM 💠 · ' : 'EQUILIBRADO · ') + str.tostring(last_entry_price_long, format.mintick) + ' · R/R 1:' + str.tostring(last_rr_long, '#.##') + ' · RSI ' + str.tostring(activation_rsi_long, '#') + '\nSL ' + str.tostring(last_sl_long, format.mintick) + ' · TP ' + str.tostring(last_tp_long, format.mintick) : 'N/A'
-    table.cell(info_table, 0, 9, ' LONG', text_color=#4CAF50, text_size=size.small)
-    table.cell(info_table, 1, 9, long_txt, text_color=is_long_active ? #4CAF50 : color.gray, text_size=size.small)
-    // 10: SHORT
-    short_txt = is_short_active ? (last_fam_short == 'Conservador' ? 'PREMIUM 💠 · ' : 'EQUILIBRADO · ') + str.tostring(last_entry_price_short, format.mintick) + ' · R/R 1:' + str.tostring(last_rr_short, '#.##') + ' · RSI ' + str.tostring(activation_rsi_short, '#') + '\nSL ' + str.tostring(last_sl_short, format.mintick) + ' · TP ' + str.tostring(last_tp_short, format.mintick) : 'N/A'
-    table.cell(info_table, 0, 10, ' SHORT', text_color=#F44336, text_size=size.small)
-    table.cell(info_table, 1, 10, short_txt, text_color=is_short_active ? #F44336 : color.gray, text_size=size.small)
+    // 8-10: POSICIÓN (control show_risk_management, cableado V8.8: OFF las oculta)
+    if show_risk_management
+        is_long_active = position_is_long and not na(last_entry_price_long)
+        is_short_active = position_is_short and not na(last_entry_price_short)
+        table.cell(info_table, 0, 8, '── POSICIÓN ──', text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+        table.cell(info_table, 1, 8, is_long_active ? 'LONG ACTIVA' : is_short_active ? 'SHORT ACTIVA' : '—', text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+        // 9: LONG (entrada + R/R + SL/TP en una celda)
+        long_txt = is_long_active ? (last_fam_long == 'Conservador' ? 'PREMIUM · ' : 'EQUILIBRADO · ') + str.tostring(last_entry_price_long, format.mintick) + ' · R/R 1:' + str.tostring(last_rr_long, '#.##') + ' · RSI ' + str.tostring(activation_rsi_long, '#') + '\nSL ' + str.tostring(last_sl_long, format.mintick) + ' · TP ' + str.tostring(last_tp_long, format.mintick) : 'N/A'
+        table.cell(info_table, 0, 9, ' LONG', text_color=#4CAF50, text_size=size.small)
+        table.cell(info_table, 1, 9, long_txt, text_color=is_long_active ? #4CAF50 : color.gray, text_size=size.small)
+        // 10: SHORT
+        short_txt = is_short_active ? (last_fam_short == 'Conservador' ? 'PREMIUM · ' : 'EQUILIBRADO · ') + str.tostring(last_entry_price_short, format.mintick) + ' · R/R 1:' + str.tostring(last_rr_short, '#.##') + ' · RSI ' + str.tostring(activation_rsi_short, '#') + '\nSL ' + str.tostring(last_sl_short, format.mintick) + ' · TP ' + str.tostring(last_tp_short, format.mintick) : 'N/A'
+        table.cell(info_table, 0, 10, ' SHORT', text_color=#F44336, text_size=size.small)
+        table.cell(info_table, 1, 10, short_txt, text_color=is_short_active ? #F44336 : color.gray, text_size=size.small)
     // 11: LIQUIDEZ
     table.cell(info_table, 0, 11, '── LIQUIDEZ ──', text_color=#bbff00, text_size=size.small, bgcolor=color.new(#bbff00, 75))
     table.cell(info_table, 1, 11, str.tostring(lev1) + '/' + str.tostring(lev2) + '/' + str.tostring(lev3) + (auto_liq_cfg ? ' auto' : ''), text_color=#bbff00, text_size=size.small, bgcolor=color.new(#bbff00, 75))
@@ -1618,10 +1726,11 @@ if barstate.islast and show_table
     // 13: Longs ↓
     table.cell(info_table, 0, 13, ' Longs ↓', text_color=#FF5252, text_size=size.small)
     table.cell(info_table, 1, 13, not na(near_long_liq) ? str.tostring(near_long_liq, format.mintick) + ' (' + str.tostring(liq_long_pct, '#.#') + '%)' : show_heatmap ? 'Sin datos' : 'OFF', text_color=#FF5252, text_size=size.small)
-    // 14: Veto de liquidez
+    // 14: Veto de liquidez + estado TARDE (entradas suprimidas por agotamiento)
     veto_txt = liq_veto_long ? 'NO LONG' : liq_veto_short ? 'NO SHORT' : 'Libre'
-    table.cell(info_table, 0, 14, ' Veto Liq', text_color=#00E676, text_size=size.small)
-    table.cell(info_table, 1, 14, enable_liq_veto ? veto_txt : 'OFF', text_color=liq_veto_long or liq_veto_short ? #FF5252 : #00E676, text_size=size.small)
+    late_txt = ex_long and ex_short ? ' · TARDE L/S' : ex_long ? ' · TARDE L' : ex_short ? ' · TARDE S' : ''
+    table.cell(info_table, 0, 14, ' Veto | Tarde', text_color=#00E676, text_size=size.small)
+    table.cell(info_table, 1, 14, (enable_liq_veto ? veto_txt : 'OFF') + late_txt, text_color=liq_veto_long or liq_veto_short ? #FF5252 : ex_long or ex_short ? #FF9800 : #00E676, text_size=size.small)
     // 15: TODOS los patrones armados simultáneamente (pueden coexistir largos y cortos)
     pat_parts = (db_armed ? '2S↑@' + str.tostring(db_ref, format.mintick) + ' ' : '') + (hsi_armed ? 'HCHi↑@' + str.tostring(hsi_ref, format.mintick) + ' ' : '') + (dt_armed ? '2T↓@' + str.tostring(dt_ref, format.mintick) + ' ' : '') + (hch_armed ? 'HCH↓@' + str.tostring(hch_ref, format.mintick) + ' ' : '')
     pat_txt = not struct_ok ? 'TF < mínima' : pat_parts == '' ? 'Ninguno' : 'ARMADO: ' + pat_parts
@@ -1649,8 +1758,13 @@ if barstate.islast and show_table
         float dsp_run = array.get(p_tp, jj) - array.get(p_e, jj)
         float dsp_prog = dsp_run != 0 ? (close - array.get(p_e, jj)) / dsp_run : 0.0   // >0 hacia el TP, <0 hacia el SL
         bool dsp_late = dsp_prog >= 0.5
-        dsp_txt := dsp_txt + (dsp_late ? ' → TARDE (no entrar)' : ' → ACTIVA')
-        dsp_col := dsp_late ? #FF9800 : dsp_col
+        // Aviso intrabar: el mechón ya perforó el SL. La ESTADÍSTICA se resuelve
+        // solo al cierre de vela (anti-repintado), pero el aviso no espera.
+        // Solo desde la barra SIGUIENTE a la señal (igual que la resolución de
+        // planes): en la propia vela de señal el mechón previo a la entrada no cuenta.
+        bool dsp_sl_touched = bar_index > array.get(p_bar, jj) and (array.get(p_dir, jj) == 'LONG ↑' ? low <= array.get(p_sl, jj) : high >= array.get(p_sl, jj))
+        dsp_txt := dsp_txt + (dsp_sl_touched ? ' → SL TOCADO (cierra al cierre de vela)' : dsp_late ? ' → TARDE (no entrar)' : ' → ACTIVA')
+        dsp_col := dsp_sl_touched ? #FF5252 : dsp_late ? #FF9800 : dsp_col
     table.cell(info_table, 0, 17, ' Plan abierto', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 17, dsp_txt, text_color=dsp_col, text_size=size.small)
     // 18: Estado de retroceso Fib
@@ -1739,3 +1853,5 @@ alertcondition(fib_long, 'RETROCESO: → LONG', 'Chilaquil PRO: entrada anticipa
 alertcondition(fib_short, 'RETROCESO: → SHORT', 'Chilaquil PRO: entrada anticipada — retroceso en zona 0.50-0.65 de pierna bajista + reacción')
 alertcondition(fvg_long, 'FVG: → LONG', 'Chilaquil PRO: retorno a Fair Value Gap alcista + reacción → LONG')
 alertcondition(fvg_short, 'FVG: → SHORT', 'Chilaquil PRO: retorno a Fair Value Gap bajista + reacción → SHORT')
+
+
