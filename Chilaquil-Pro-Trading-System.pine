@@ -1899,6 +1899,3 @@ alertcondition(fib_short, 'RETROCESO: → SHORT', 'Chilaquil PRO: entrada antici
 alertcondition(fvg_long, 'FVG: → LONG', 'Chilaquil PRO: retorno a Fair Value Gap alcista + reacción → LONG')
 alertcondition(fvg_short, 'FVG: → SHORT', 'Chilaquil PRO: retorno a Fair Value Gap bajista + reacción → SHORT')
 
-// ═══ FIN DEL SCRIPT — CHILAQUIL V8.9 ═══
-// Si ves cualquier línea DEBAJO de este marcador en tu editor, es código
-// sobrante de un pegado anterior: selecciónalo y bórralo.
