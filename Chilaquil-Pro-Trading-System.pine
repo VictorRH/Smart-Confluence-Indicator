@@ -15,6 +15,11 @@
 //   (8) Spring/Upthrust exigen rango lateral (input wyck_rng_atr);
 //   (9) Test exige volumen seco (input wyck_test_dry); (16) ventana
 //   reproducible con fecha fija (stats_fixed) en vez de timenow. V9.1c: los
+//   V9.1d (auditoría 3): #16 la fecha fija vuelve a ser ANCLA con escalado por
+//   TF (antes un 1m procesaba años → colapso del heatmap); #8 el Spring/
+//   Upthrust recuperan el contexto previo (caída/subida) ADEMÁS del rango;
+//   #4 el plan del núcleo solo se abre cuando la máquina entra → "Núcleo
+//   SL/TP" y "Núcleo REAL" miden la misma población.
 //   perps con denominación ×1000 (1000SHIB/PEPE/BONK) se detectan solos —
 //   antes el ticker OI se construía con el basecurrency del spot y no existía.
 //   Recableados
@@ -299,7 +304,7 @@ exit_on_rsi = input.bool(true, 'Salir por RSI extremo', group='Señales', toolti
 plan_buffer = input.int(120, 'Planes abiertos en memoria', group='Gestión de Riesgo', minval=20, maxval=400, tooltip='Al desbordar, el plan más antiguo se CIERRA A MERCADO y se contabiliza en las stats. En V9.0 se descartaba en silencio (sesgo de supervivencia: desaparecían justo los peores trades).')
 wyck_rng_atr = input.float(6.0, 'Ancho máximo del rango lateral (ATR)', group='WYCKOFF 🌀', minval=2.0, maxval=20.0, step=0.5, tooltip='Spring/Upthrust EXIGEN estructura de rango: (highest-lowest)/ATR de la ventana <= este valor. Sin esto, cualquier mecha en caída libre contaba como Spring.')
 wyck_test_dry = input.float(0.8, 'Volumen seco máximo del Test (× media)', group='WYCKOFF 🌀', minval=0.3, maxval=1.5, step=0.05, tooltip='El Test válido de Wyckoff vuelve al nivel con VOLUMEN BAJO (oferta agotada). V9.0 aceptaba tests con volumen climático, que es la señal contraria.')
-stats_fixed = input.bool(true, 'Ventana reproducible (fecha fija)', group='Visual', tooltip='timenow mueve el inicio de la ventana en cada refresco: dos ejecuciones del mismo backtest dan n distintos. ON = ancla fija auditable (fecha de abajo). OFF = ancla al último dato del dataset (constante dentro de una corrida).')
+stats_fixed = input.bool(true, 'Ventana reproducible (fecha fija)', group='Visual', tooltip='timenow mueve el inicio de la ventana en cada refresco: dos ejecuciones del mismo backtest dan n distintos. ON = ancla fija auditable (fecha de abajo). OFF = ancla al último dato del dataset (constante dentro de una corrida). OJO: con TFs bajas, pon la fecha fija 3-6 meses atrás — el escalado por TF retrocede desde esa ancla.')
 stats_start_in = input.time(timestamp('2024-01-01T00:00:00+0000'), 'Inicio fijo de la ventana', group='Visual')
 
 // ============================================
@@ -312,8 +317,11 @@ is_high_timeframe = tf_in_seconds >= 86400
 // Se calcula aquí porque varios módulos la usan (heatmap, señales, FVG).
 // V9.1 (#16): ancla REPRODUCIBLE. timenow avanza con el reloj → n irrepetible.
 int anchor_t = stats_fixed ? stats_start_in : last_bar_time
-auto_start = stats_fixed ? stats_start_in :
-     tf_in_seconds < 900 ? anchor_t - 7 * 86400000 :      // < 15m : 1 semana
+// V9.1d (fix #16): la fecha fija es la ANCLA, no la ventana entera. Antes,
+// con stats_fixed=ON, un gráfico de 1m intentaba procesar desde la fecha fija
+// SIN el escalado por TF → el bucle del heatmap colapsaba. Ahora el escalado
+// se aplica SIEMPRE; solo cambia el punto de referencia (fijo vs último dato).
+auto_start = tf_in_seconds < 900 ? anchor_t - 7 * 86400000 :      // < 15m : 1 semana
      tf_in_seconds < 3600 ? anchor_t - 30 * 86400000 :    // < 1H  : 1 mes
      tf_in_seconds < 14400 ? anchor_t - 90 * 86400000 :   // < 4H  : 3 meses
      tf_in_seconds < 86400 ? anchor_t - 180 * 86400000 :  // < 1D  : 6 meses
@@ -745,9 +753,9 @@ vol_dry = volume < ta.sma(volume, 20) * wyck_test_dry
 
 // SPRING: el precio rompe el soporte del rango pero CIERRA de vuelta
 // dentro, tras una caída previa = barrida de stops + absorción alcista.
-spring_raw = in_range and low < wyck_sup and close > wyck_sup and vol_ok
+spring_raw = in_range and low < wyck_sup and close > wyck_sup and close < close[wyck_len] and vol_ok
 // UPTHRUST: espejo — rompe la resistencia y vuelve dentro, tras subida.
-upthrust_raw = in_range and high > wyck_res and close < wyck_res and vol_ok
+upthrust_raw = in_range and high > wyck_res and close < wyck_res and close > close[wyck_len] and vol_ok
 
 var int last_spring = -100000
 var int last_upthrust = -100000
@@ -1630,9 +1638,13 @@ if sell_signal and not position_is_short and cool_short_ok
 // El plan sombra (id 5) aplica el MISMO filtro de agotamiento que el núcleo (id 4):
 // la única diferencia entre ambos es el veto de liquidez.
 // El R real de la máquina de estados se mide aparte en "Núcleo REAL".
-if buy_signal
+// V9.1d (fix #4): el plan del núcleo solo se abre cuando la máquina realmente
+// entra (misma regla: flanco + cooldown). Así "Núcleo SL/TP" y "Núcleo REAL"
+// miden la MISMA población y son comparables. La sombra del veto (id 5) sigue
+// midiendo señales vetadas (ablación, a propósito).
+if entry_long
     f_push_plan('LONG ↑', close, close - stop_distance, close + tp_distance, 4, 'Núcleo')
-if sell_signal
+if entry_short
     f_push_plan('SHORT ↓', close, close + stop_distance, close - tp_distance, 4, 'Núcleo')
 if core_ok_long and liq_veto_long and not ex_long
     f_push_plan('LONG ↑', close, close - stop_distance, close + tp_distance, 5, 'Núcleo vetada')
