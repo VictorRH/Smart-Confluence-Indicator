@@ -14,15 +14,15 @@
 //   directamente en LTF — la fila "OI/intrabarra" debe pasar a "varía";
 //   (8) Spring/Upthrust exigen rango lateral (input wyck_rng_atr);
 //   (9) Test exige volumen seco (input wyck_test_dry); (16) ventana
-//   reproducible con fecha fija (stats_fixed) en vez de timenow. V9.1c: los
+//   reproducible con fecha fija (stats_fixed) en vez de timenow.
 //   V9.1d (auditoría 3): #16 la fecha fija vuelve a ser ANCLA con escalado por
 //   TF (antes un 1m procesaba años → colapso del heatmap); #8 el Spring/
 //   Upthrust recuperan el contexto previo (caída/subida) ADEMÁS del rango;
 //   #4 el plan del núcleo solo se abre cuando la máquina entra → "Núcleo
 //   SL/TP" y "Núcleo REAL" miden la misma población.
-//   perps con denominación ×1000 (1000SHIB/PEPE/BONK) se detectan solos —
-//   antes el ticker OI se construía con el basecurrency del spot y no existía.
-//   Recableados
+//   V9.1c: los perps con denominación ×1000 (1000SHIB/PEPE/BONK) se detectan
+//   solos — antes el ticker OI se construía con el basecurrency del spot y no
+//   existía. Recableados
 //   sin riesgo: MACD (4 plots), nubes (2) y letras C/V de Equilibrado (labels,
 //   0 plots). Plots reales: 26 alertas + EMA3 + SQZMOM2 + liq2 + MACD4 +
 //   nubes2 = 39/64. NO incluidos (decisión, no bug): neckline inclinada (10),
@@ -1911,7 +1911,9 @@ if barstate.islast and show_table
     table.cell(info_table, 1, 14, (enable_liq_veto ? veto_txt : 'OFF') + late_txt, text_color=liq_veto_long or liq_veto_short ? #FF5252 : ex_long or ex_short ? #FF9800 : #00E676, text_size=size.small)
     // 15: TODOS los patrones armados simultáneamente (pueden coexistir largos y cortos)
     pat_parts = (db_armed ? '2S↑@' + str.tostring(db_ref, format.mintick) + ' ' : '') + (hsi_armed ? 'HCHi↑@' + str.tostring(hsi_ref, format.mintick) + ' ' : '') + (dt_armed ? '2T↓@' + str.tostring(dt_ref, format.mintick) + ' ' : '') + (hch_armed ? 'HCH↓@' + str.tostring(hch_ref, format.mintick) + ' ' : '')
-    pat_txt = not struct_ok ? 'TF < mínima' : pat_parts == '' ? 'Ninguno' : 'ARMADO: ' + pat_parts
+    // '\n' antes de la lista: las tablas de Pine no tienen ancho configurable
+    // (el contenido largo se recorta) — partir en líneas cortas es el fix.
+    pat_txt = not struct_ok ? 'TF < mínima' : pat_parts == '' ? 'Ninguno' : 'ARMADO:\n' + pat_parts
     table.cell(info_table, 0, 15, 'Patrones', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 15, show_patterns ? pat_txt : 'OFF', text_color=not struct_ok ? color.gray : pat_parts == '' ? #00E676 : #FF9800, text_size=size.small)
     // 16: Último evento Wyckoff
@@ -1941,7 +1943,7 @@ if barstate.islast and show_table
         // Solo desde la barra SIGUIENTE a la señal (igual que la resolución de
         // planes): en la propia vela de señal el mechón previo a la entrada no cuenta.
         bool dsp_sl_touched = bar_index > array.get(p_bar, jj) and (array.get(p_dir, jj) == 'LONG ↑' ? low <= array.get(p_sl, jj) : high >= array.get(p_sl, jj))
-        dsp_txt := dsp_txt + (dsp_sl_touched ? ' → SL TOCADO (cierra al cierre de vela)' : dsp_late ? ' → TARDE (no entrar)' : ' → ACTIVA')
+        dsp_txt := dsp_txt + '\n' + (dsp_sl_touched ? '⚠ SL TOCADO (resuelve al cierre)' : dsp_late ? 'TARDE (no entrar)' : 'ACTIVA')
         dsp_col := dsp_sl_touched ? #FF5252 : dsp_late ? #FF9800 : dsp_col
     table.cell(info_table, 0, 17, ' Plan abierto', text_color=#00E676, text_size=size.small)
     table.cell(info_table, 1, 17, dsp_txt, text_color=dsp_col, text_size=size.small)
@@ -2032,3 +2034,6 @@ alertcondition(fib_short, 'RETROCESO: → SHORT', 'Chilaquil PRO: entrada antici
 alertcondition(fvg_long, 'FVG: → LONG', 'Chilaquil PRO: retorno a Fair Value Gap alcista + reacción → LONG')
 alertcondition(fvg_short, 'FVG: → SHORT', 'Chilaquil PRO: retorno a Fair Value Gap bajista + reacción → SHORT')
 
+// ═══ FIN DEL SCRIPT — CHILAQUIL V9.1 ═══
+// Si ves cualquier línea DEBAJO de este marcador en tu editor, es código
+// sobrante de un pegado anterior: selecciónalo y bórralo.
